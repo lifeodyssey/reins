@@ -1,11 +1,17 @@
 {
   "name": "reins",
-  "version": "0.1.0",
-  "description": "Multi-agent sprint orchestrator. Run /reins to start a sprint with Planner, Executor, Reviewer, and Tester agents — each with live streaming, interrupt, and direct chat.",
+  "version": "0.2.0",
+  "description": "Harness engineering framework for Claude Code. Multi-agent sprint orchestrator with Planner, Executor, Reviewer, and Tester agents \u2014 live streaming, interrupt, direct chat, and permission hooks.",
   "author": {
     "name": "lumimamini"
   },
   "repository": "https://github.com/lumimamini/reins",
   "license": "MIT",
-  "keywords": ["harness", "orchestrator", "multi-agent", "sprint", "tdd"]
+  "keywords": [
+    "harness",
+    "orchestrator",
+    "multi-agent",
+    "sprint",
+    "tdd"
+  ]
 }

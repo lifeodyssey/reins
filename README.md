@@ -1,8 +1,8 @@
 # Reins
 
-Multi-agent sprint orchestrator plugin for Claude Code.
+Harness engineering framework for Claude Code. A multi-agent sprint orchestrator that turns GitHub issues into merged PRs.
 
-Label GitHub issues, run `/reins`, watch agents plan, execute, review, and test your code — with live streaming, interrupt, and direct agent chat.
+Label issues, run `/reins`, watch agents plan, execute, review, and test your code — with live streaming, interrupt, and direct agent chat. Built on harness engineering patterns from Anthropic, OpenAI, Stripe, and Martin Fowler.
 
 ## Install
 
