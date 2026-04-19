@@ -13,7 +13,7 @@ claude plugin add github:lifeodyssey/reins
 ## Usage
 
 ```
-/reins          Launch the orchestrator UI (Gradio)
+/reins          Launch the orchestrator UI
 /reins-stop     Stop the orchestrator
 ```
 
@@ -27,10 +27,10 @@ In the UI:
 ## Architecture
 
 ```
-You ──→ Orchestrator (Python state machine)
+You ──→ Orchestrator (Bun + WebSocket, src/server.ts)
               │
-              ├── Router (opus 1-shot) ── decides next step
-              ├── Verifier (opus 1-shot) ── checks ACs
+              ├── Router (sonnet 1-shot) ── decides next step
+              ├── Verifier (sonnet 1-shot) ── checks ACs
               │
               ├── Executor (sonnet session) ── TDD, creates PR
               ├── Reviewer (sonnet session) ── posts findings to PR
@@ -43,12 +43,18 @@ You ──→ Orchestrator (Python state machine)
 - **Early-merge with rebase:** fast cards don't wait for slow ones
 - **Permission hooks:** block test tampering, force push, source code leaks
 
+## Tech Stack
+
+- **Runtime:** [Bun](https://bun.sh/) (TypeScript)
+- **SDK:** `@anthropic-ai/claude-agent-sdk`
+- **UI:** Plain HTML/CSS/JS served by Bun HTTP + WebSocket
+- **Build:** `bun build --compile` → single native binary (~59MB)
+
 ## Requirements
 
 ### Required
 
 - [Claude Code](https://claude.ai/code) with Max subscription
-- [uv](https://docs.astral.sh/uv/) — Python package manager (runs Gradio UI)
 - [gh](https://cli.github.com/) — GitHub CLI, authenticated (PR/merge/comment ops)
 
 ### Recommended Plugins
@@ -100,6 +106,15 @@ Reins registers these hooks to enforce agent boundaries:
 |------|-------|---------------|
 | check-write | PreToolUse (Write/Edit) | `.skip()`, `.only()` in test files. Warns on 5+ hardcoded returns. |
 | check-bash | PreToolUse (Bash) | `git push --force`, `git push -f` |
+
+## Development
+
+```bash
+cd plugins/reins
+bun install
+bun run src/server.ts     # dev mode on :7860
+bun run build             # compile to native binary
+```
 
 ## License
 

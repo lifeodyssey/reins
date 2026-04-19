@@ -4,7 +4,7 @@ This file provides repo-wide guidance for agentic coding tools (Codex, Claude Co
 
 ## What This Is
 
-Reins is a Claude Code plugin that orchestrates multi-agent sprints. It is NOT a Python library — it is a directory of `.md` agent definitions, skill instructions, hook scripts, and a Gradio UI.
+Reins is a Claude Code plugin that orchestrates multi-agent sprints. It is a TypeScript Bun server with `.md` agent definitions, skill instructions, and hook scripts.
 
 ## Source of Truth
 
@@ -15,36 +15,35 @@ skills/*/SKILL.md             ← Skill definitions (sprint, plan, backend-tdd, 
 hooks/hooks.json              ← Hook registration (PreToolUse for Write/Edit/Bash)
 hooks/scripts/*.sh            ← Hook implementations (bash, reads JSON from stdin)
 commands/*.md                 ← Slash commands (/reins, /reins-stop)
-scripts/*.py                  ← Gradio UI + orchestrator runtime (Python)
+src/*.ts                      ← Bun server + orchestrator runtime (TypeScript)
 ```
 
 ## Guardrails
 
-- Agent `.md` files are prompts, not code. Do not add Python/JS logic to them.
+- Agent `.md` files are prompts, not code. Do not add TS/JS logic to them.
 - Hook scripts read JSON from stdin and output JSON to stdout. They must exit 0.
-- `scripts/*.py` imports are relative (no `harness.` prefix). All modules live flat in `scripts/`.
-- The Gradio UI runs via `uv run --with gradio --with claude-agent-sdk python scripts/gradio-ui.py`. No venv is committed.
-- `package.json` exists for npm publishing only. There is no JS code.
+- The server runs via `bun run src/server.ts`. Entry point is `src/server.ts`.
 - Version must match in both `package.json` and `.claude-plugin/plugin.json`.
 
 ## Agent Architecture
 
 ```
-Orchestrator (Python state machine, scripts/gradio-ui.py)
+Orchestrator (Bun HTTP + WebSocket, src/server.ts)
   │
-  ├── Router (1-shot query)     → scripts/router.py
-  ├── Verifier (1-shot query)   → scripts/verifier.py
+  ├── Router (1-shot query)     → src/router.ts
+  ├── Verifier (1-shot query)   → src/verifier.ts
   │
-  ├── Executor (ClaudeSDKClient session)  → agents/executor.md
-  ├── Reviewer (ClaudeSDKClient session)  → agents/reviewer.md
-  ├── Tester   (ClaudeSDKClient session)  → agents/tester.md (tests running app, writes automated tests, tags for deploy)
-  ├── Planner  (ClaudeSDKClient session)  → agents/planner.md
-  └── Designer (ClaudeSDKClient session)  → agents/designer.md
+  ├── Executor (query session)  → agents/executor.md
+  ├── Reviewer (query session)  → agents/reviewer.md
+  ├── Tester   (query session)  → agents/tester.md
+  ├── Planner  (query session)  → agents/planner.md
+  └── Designer (query session)  → agents/designer.md
 ```
 
-- Session agents stream tool calls to Gradio in real-time
+- Session agents stream tool calls to the UI via WebSocket in real-time
 - Router and Verifier are stateless 1-shot calls (no streaming)
 - Agent sessions are per-card, per-task. Context resets between cards.
+- SDK uses `query()` from `@anthropic-ai/claude-agent-sdk` for all agent interactions
 
 ## External Dependencies (soft)
 
@@ -72,8 +71,8 @@ Agent `.md` files reference skills and MCP servers from other plugins. These are
 
 ```bash
 # Development
-uv run python scripts/gradio-ui.py          # Launch Gradio UI on :7860
-uv run pytest scripts/                       # Run tests (if test files exist in scripts/)
+bun run src/server.ts                    # Launch server on :7860
+bun run build                            # Compile to native binary
 
 # Testing hooks
 echo '{"tool_input":{"file_path":"tests/test_foo.py","content":".skip()"}}' | bash hooks/scripts/check-write.sh
@@ -92,12 +91,11 @@ echo '{"tool_input":{"command":"git push --force"}}' | bash hooks/scripts/check-
 - Skills: kebab-case directory in `skills/` with `SKILL.md`
 - Commands: kebab-case `.md` in `commands/`
 - Hook scripts: `check-*.sh` in `hooks/scripts/`
-- Python modules: snake_case `.py` in `scripts/`
+- TypeScript modules: kebab-case `.ts` in `src/`
 - Versions: semver in `package.json` + `.claude-plugin/plugin.json` (must match)
 
 ## MUST NOT
 
-- Commit `.venv/`, `node_modules/`, `__pycache__/`, `.harness/`, `.reins/`
-- Add `harness.` prefix to Python imports (modules are flat in `scripts/`)
-- Put JS/TS code in this repo (it's Python + Markdown + Bash)
+- Commit `node_modules/`, `.harness/`, `.reins/`, `bun.lockb`
+- Put Python code in this repo (it's TypeScript + Markdown + Bash)
 - Modify hook scripts to require external binaries beyond `jq` and `bash`
