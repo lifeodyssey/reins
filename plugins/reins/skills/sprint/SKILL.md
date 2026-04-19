@@ -1,6 +1,6 @@
 ---
 name: sprint
-description: "Run a multi-agent sprint. Use when the user wants to plan, execute, review, and test a set of GitHub issues as a coordinated sprint with parallel card execution."
+description: "Run a multi-agent sprint. Use when the user wants to plan, execute, review, and test a set of GitHub issues as a coordinated sprint."
 version: 0.1.0
 ---
 
@@ -14,14 +14,13 @@ Launch the Reins orchestrator to run a multi-agent sprint.
 
 ## Steps
 
-1. **Launch the Gradio UI:**
+1. **Launch the server:**
 
 ```bash
 cd "$CLAUDE_PLUGIN_ROOT"
-chmod +x hooks/scripts/*.sh
 lsof -ti :7860 | xargs kill 2>/dev/null || true
-nohup uv run --with gradio --with claude-agent-sdk python scripts/gradio-ui.py > /tmp/reins.log 2>&1 &
-sleep 5
+bun run src/server.ts &
+sleep 1
 open http://localhost:7860
 ```
 
