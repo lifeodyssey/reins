@@ -14,20 +14,14 @@ and opens the browser. The UI lets you:
 
 ## Steps
 
-1. Start the server:
+1. Start the server and open browser:
 
 ```bash
 lsof -ti :7860 | xargs kill 2>/dev/null || true
 bun run "$CLAUDE_PLUGIN_ROOT/src/server.ts" &
 UI_PID=$!
+sleep 1 && open http://localhost:7860
 echo "Reins UI started (PID: $UI_PID) on http://localhost:7860"
-```
-
-2. Open the browser:
-
-```bash
-sleep 1
-open http://localhost:7860
 ```
 
 3. Tell the user:
