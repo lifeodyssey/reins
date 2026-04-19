@@ -364,9 +364,16 @@ async def orchestrator_chat(
 
                 yield history, _build_status(), _build_timeline(), render_sprint_board(SPRINT_PLAN)
 
-            # ── Phase 4: Tester tests running app (after wave merges) ──
+            # ── Phase 4: Start app + Tester tests (after wave merges) ──
             merged_cards = [c for c in wave_cards if c.status == "merged"]
             if merged_cards:
+                # Orchestrator starts the app (not the Tester)
+                history.append({"role": "assistant",
+                                "content": f"🚀 **Orchestrator** starting app for Wave {wave_num} testing...\n"
+                                           f"`make serve` (backend :8080 + frontend :3000)"})
+                yield history, _build_status(), _build_timeline(), render_sprint_board(SPRINT_PLAN)
+
+                # Tester tests the running app
                 history.append({"role": "assistant",
                                 "content": f"🧪 **Tester** — testing running app after Wave {wave_num} merge.\n"
                                            f"Testing {len(merged_cards)} merged cards on main..."})
@@ -397,14 +404,45 @@ async def orchestrator_chat(
                                            f"{len(merged_cards)} cards merged and tested."})
                 yield history, _build_status(), _build_timeline(), render_sprint_board(SPRINT_PLAN)
 
-        # ── Sprint complete ──
+        # ── Sprint complete — ask user to approve deploy ──
         history.append({"role": "assistant",
                         "content": "## 🎉 Sprint Complete\n\n"
                                    + render_sprint_board(SPRINT_PLAN)
-                                   + "\n\n*All waves executed, reviewed, merged, and tested.*"})
+                                   + "\n\n*All waves executed, reviewed, merged, and tested.*\n\n"
+                                   + "---\n\n"
+                                   + "**Deploy?** Orchestrator will tag and push to trigger CI deploy.\n\n"
+                                   + "`deploy` — tag + push (triggers production deploy)\n"
+                                   + "`skip-deploy` — done, don't deploy yet"})
         EVENT_LOG.append("orchestrator", "sprint_complete")
         ORCHESTRATOR_HISTORY = history
         yield history, _build_status(), _build_timeline(), render_sprint_board(SPRINT_PLAN)
+        return
+
+    # ── deploy (after sprint complete) ──
+    if msg == "deploy" and SPRINT_PLAN:
+        history.append({"role": "assistant",
+                        "content": "🚀 **Deploying...**\n\n"
+                                   "```\n"
+                                   "LATEST=$(git tag --sort=-v:refname | head -1)\n"
+                                   "NEXT=$(echo $LATEST | awk -F. '{print $1\".\"$2\".\"$3+1}')\n"
+                                   "git tag $NEXT && git push origin $NEXT\n"
+                                   "```\n\n"
+                                   "*(Orchestrator runs this, not the Tester agent.)*\n"
+                                   "CI deploy triggered. Sprint done."})
+        EVENT_LOG.append("orchestrator", "deploy")
+        _log("deploy", detail="version tagged")
+        ORCHESTRATOR_HISTORY = history
+        board_text = render_sprint_board(SPRINT_PLAN)
+        yield history, _build_status(), _build_timeline(), board_text
+        return
+
+    # ── skip-deploy ──
+    if msg == "skip-deploy" and SPRINT_PLAN:
+        history.append({"role": "assistant",
+                        "content": "⏭️ Deploy skipped. Sprint complete without deploy."})
+        ORCHESTRATOR_HISTORY = history
+        board_text = render_sprint_board(SPRINT_PLAN)
+        yield history, _build_status(), _build_timeline(), board_text
         return
 
     # ── chat with <agent> ──
