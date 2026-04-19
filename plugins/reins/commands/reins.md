@@ -17,8 +17,8 @@ and opens the browser. The UI lets you:
 1. Start the server:
 
 ```bash
-cd "$CLAUDE_PLUGIN_ROOT"
-bun run src/server.ts &
+lsof -ti :7860 | xargs kill 2>/dev/null || true
+bun run "$CLAUDE_PLUGIN_ROOT/src/server.ts" &
 UI_PID=$!
 echo "Reins UI started (PID: $UI_PID) on http://localhost:7860"
 ```
