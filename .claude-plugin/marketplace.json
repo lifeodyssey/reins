@@ -1,0 +1,16 @@
+{
+  "name": "reins",
+  "description": "Harness engineering framework for Claude Code. Multi-agent sprint orchestrator.",
+  "owner": {
+    "name": "lifeodyssey"
+  },
+  "plugins": [
+    {
+      "name": "reins",
+      "description": "Multi-agent sprint orchestrator with Planner, Executor, Reviewer, and Tester agents — live streaming, interrupt, direct chat, and permission hooks.",
+      "category": "development",
+      "source": ".",
+      "homepage": "https://github.com/lifeodyssey/reins"
+    }
+  ]
+}
