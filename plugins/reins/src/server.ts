@@ -207,22 +207,197 @@ async function streamAgent(session: AgentSession, task: string, history: ChatMes
 }
 
 // ---------------------------------------------------------------------------
+// Plan helpers
+// ---------------------------------------------------------------------------
+interface PendingPlan {
+  name: string;
+  cards: { title: string; slug: string; wave: number; ac: string[] }[];
+}
+
+let PENDING_PLAN: PendingPlan | null = null;
+
+function parseIssueNumbers(message: string): number[] {
+  const match = message.match(/--issues\s+([\d,\s]+)/);
+  if (!match) return [];
+  return match[1]
+    .split(",")
+    .map((s) => parseInt(s.trim(), 10))
+    .filter((n) => !isNaN(n));
+}
+
+function fetchIssueDetails(issueNumbers: number[]): { number: number; title: string; body: string; labels: string[] }[] {
+  const issues: { number: number; title: string; body: string; labels: string[] }[] = [];
+  for (const num of issueNumbers) {
+    const result = Bun.spawnSync(["gh", "issue", "view", String(num), "--json", "number,title,body,labels"]);
+    if (result.exitCode === 0) {
+      try {
+        const data = JSON.parse(result.stdout.toString().trim());
+        issues.push({
+          number: data.number,
+          title: data.title,
+          body: data.body ?? "",
+          labels: (data.labels ?? []).map((l: any) => l.name),
+        });
+      } catch {}
+    }
+  }
+  return issues;
+}
+
+function parsePlannerOutput(history: ChatMessage[]): PendingPlan | null {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const entry = history[i];
+    if (entry.role === "assistant" && entry.content.includes("planner")) {
+      const jsonMatch = entry.content.match(/```json\s*\n([\s\S]*?)\n```/);
+      if (jsonMatch) {
+        try {
+          const data = JSON.parse(jsonMatch[1]);
+          if (data.name && Array.isArray(data.cards)) return data as PendingPlan;
+        } catch {
+          continue;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function computeNextTag(): { latest: string; next: string } {
+  const result = Bun.spawnSync(["git", "tag", "--sort=-v:refname"]);
+  const tags = result.stdout.toString().trim().split("\n").filter(Boolean);
+  const latest = tags[0] ?? "v0.0.0";
+  const parts = latest.replace(/^v/, "").split(".");
+  const nextPatch = parseInt(parts[2] ?? "0", 10) + 1;
+  return { latest, next: `v${parts[0] ?? "0"}.${parts[1] ?? "0"}.${nextPatch}` };
+}
+
+// ---------------------------------------------------------------------------
+// Verify + Route loop (re-entrant, bounded by reviewRound)
+// ---------------------------------------------------------------------------
+async function verifyAndRoute(card: CardState, history: ChatMessage[]): Promise<ChatMessage[]> {
+  let executorSummary = "";
+  for (let i = history.length - 1; i >= 0; i--) {
+    const entry = history[i];
+    if (entry.role === "assistant" && entry.content.includes(`executor-${card.slug}`)) {
+      executorSummary = entry.content.slice(0, 500);
+      break;
+    }
+  }
+
+  const verifierPrompt = buildVerifierPrompt(card.acceptanceCriteria, "", executorSummary);
+  let vResult: { approved: boolean; acResults: any[]; issues: string[] };
+  try {
+    const vRaw = await callOneshot("Verifier", verifierPrompt);
+    vResult = parseVerifierResponse(vRaw);
+  } catch (e: any) {
+    vResult = { approved: false, acResults: [], issues: [`Verifier error: ${e.message}`] };
+    history.push({ role: "assistant", content: `\u274C **Verifier error for Card ${card.id}:** ${e.message}` });
+    pushFullState(history);
+  }
+
+  const routerPrompt = buildRouterPrompt(
+    card.title,
+    vResult.approved ? "approve" : "request_changes",
+    card.reviewRound + 1,
+    JSON.stringify(vResult),
+  );
+  let rResult: { decision: string; reason: string };
+  try {
+    const rRaw = await callOneshot("Router", routerPrompt);
+    rResult = parseRouterResponse(rRaw);
+  } catch (e: any) {
+    rResult = { decision: "escalate_to_human", reason: `Router error: ${e.message}` };
+    history.push({ role: "assistant", content: `\u274C **Router error for Card ${card.id}:** ${e.message}` });
+    pushFullState(history);
+  }
+
+  const vIcon = vResult.approved ? "\u2713" : "\u2717";
+  history.push({
+    role: "assistant",
+    content:
+      `---\n${vIcon} **Verifier** Card ${card.id}: ${vResult.approved ? "approved" : "issues found"}\n` +
+      `\uD83D\uDD00 **Router** Card ${card.id}: \`${rResult.decision}\` \u2014 ${rResult.reason}\n---`,
+  });
+
+  EVENT_LOG.append("verifier", "check", { card: card.id, approved: vResult.approved });
+  EVENT_LOG.append("router", "decide", { card: card.id, decision: rResult.decision });
+
+  switch (rResult.decision) {
+    case "merge":
+      card.status = "merged";
+      break;
+    case "skip":
+      card.status = "skipped";
+      break;
+    case "escalate_to_human":
+      card.status = "blocked";
+      history.push({
+        role: "assistant",
+        content: `**Card ${card.id} escalated.** ${rResult.reason}\n\n\`resolve ${card.id}\` to unblock, \`skip ${card.id}\` to skip.`,
+      });
+      break;
+    case "re_execute":
+    case "re_execute_with_findings": {
+      card.reviewRound++;
+      if (card.reviewRound >= 3) {
+        card.status = "blocked";
+        history.push({
+          role: "assistant",
+          content: `**Card ${card.id} blocked** after ${card.reviewRound} attempts. Escalating.\n\n\`resolve ${card.id}\` or \`skip ${card.id}\``,
+        });
+      } else {
+        card.status = "executing";
+        history.push({
+          role: "assistant",
+          content: `\u{1F504} **Re-executing Card ${card.id}** (attempt ${card.reviewRound + 1}). Reason: ${rResult.reason}`,
+        });
+        pushFullState(history);
+        const reExec = getOrCreateSession(`executor-${card.slug}`, "Executor");
+        try {
+          history = await streamAgent(
+            reExec,
+            `Re-implement Card ${card.id}: ${card.title}. Previous issues: ${rResult.reason}. ` +
+              `ACs: ${card.acceptanceCriteria.join(", ")}. Branch: ${cardBranch(card)}`,
+            history,
+          );
+        } catch (e: any) {
+          history.push({ role: "assistant", content: `\u274C Re-executor error: ${e.message}` });
+        }
+        // Recurse through verify+route again
+        history = await verifyAndRoute(card, history);
+      }
+      break;
+    }
+    case "proceed_to_review": {
+      card.status = "reviewing";
+      const reReviewer = getOrCreateSession(`reviewer-${card.slug}`, "Reviewer");
+      history = await streamAgent(
+        reReviewer,
+        `Re-review Card ${card.id}: ${card.title}. ACs: ${card.acceptanceCriteria.join(", ")}.`,
+        history,
+      );
+      history = await verifyAndRoute(card, history);
+      break;
+    }
+    case "proceed_to_test":
+      card.status = "merged"; // test phase picks up "merged" cards
+      break;
+    default:
+      card.status = "blocked";
+      history.push({
+        role: "assistant",
+        content: `**Card ${card.id}: unknown decision** \`${rResult.decision}\`. Escalating.\n\n\`resolve ${card.id}\` or \`skip ${card.id}\``,
+      });
+      break;
+  }
+
+  pushFullState(history);
+  return history;
+}
+
+// ---------------------------------------------------------------------------
 // Orchestrator logic
 // ---------------------------------------------------------------------------
-const MOCK_SPEC = `**Sprint Spec: iter-11**
-
-**Goal:** Fix route planning + add SSE streaming
-
-**Cards (4, 2 waves):**
-| # | Title | Wave | Branch |
-|---|-------|------|--------|
-| 1 | Fix route planning | 1 | \`card-1-fix-route\` |
-| 2 | Add SSE streaming | 1 | \`card-2-add-sse\` |
-| 3 | Refactor executor agent | 2 | \`card-3-refactor-exec\` |
-| 4 | Update frontend map | 2 | \`card-4-update-map\` |
-
-**Wave graph:** \`[1,2]\` \u2192 \`[3,4]\` (parallel within waves, sequential between)`;
-
 async function orchestratorChat(message: string, history: ChatMessage[]): Promise<ChatMessage[]> {
   if (!message.trim()) {
     pushFullState(history);
@@ -232,47 +407,105 @@ async function orchestratorChat(message: string, history: ChatMessage[]): Promis
   history = [...history, { role: "user", content: message }];
   const msg = message.trim().toLowerCase();
 
-  // /plan command
+  // /plan command — fetch issues, run Planner, parse output
   if (msg.includes("/plan")) {
-    log("sprint_start", "orchestrator", "iter-11");
+    const issueNums = parseIssueNumbers(message);
+    log("plan_start", "orchestrator", issueNums.length > 0 ? `issues: ${issueNums.join(",")}` : "explore");
     history.push({ role: "assistant", content: "\uD83D\uDCCB Opening **Planner** session..." });
     pushFullState(history);
 
+    let plannerPrompt: string;
+    if (issueNums.length > 0) {
+      const issues = fetchIssueDetails(issueNums);
+      if (issues.length === 0) {
+        history.push({ role: "assistant", content: `\u274C Could not fetch any issues. Check \`gh auth status\` and issue numbers.` });
+        orchestratorHistory = history;
+        pushFullState(history);
+        return history;
+      }
+      const issueContext = issues
+        .map((i) => `### Issue #${i.number}: ${i.title}\n${i.body}\nLabels: ${i.labels.join(", ") || "none"}`)
+        .join("\n\n");
+      plannerPrompt =
+        `You have the following GitHub issues to plan:\n\n${issueContext}\n\n` +
+        `Explore the codebase to understand the current architecture, then produce a sprint spec.\n\n` +
+        `Include a Task Breakdown where each task has a title, slug, wave number, and acceptance criteria.\n` +
+        `Tasks that can run in parallel share a wave. Dependent tasks go in later waves.\n\n` +
+        `IMPORTANT: At the end, output a JSON block fenced with \`\`\`json containing:\n` +
+        `{"name": "iter-name", "cards": [{"title": "...", "slug": "...", "wave": 1, "ac": ["criterion 1", "criterion 2"]}]}`;
+    } else {
+      plannerPrompt =
+        `Explore the codebase and propose work for the next iteration.\n\n` +
+        `Produce a sprint spec with a Task Breakdown. Each task needs a title, slug, wave number, and acceptance criteria.\n\n` +
+        `IMPORTANT: At the end, output a JSON block fenced with \`\`\`json containing:\n` +
+        `{"name": "iter-name", "cards": [{"title": "...", "slug": "...", "wave": 1, "ac": ["criterion 1", "criterion 2"]}]}`;
+    }
+
     const planner = getOrCreateSession("planner", "Planner");
     try {
-      history = await streamAgent(
-        planner,
-        "List all Python files in the harness/ directory and describe the project structure. " +
-          "Then propose a sprint plan with 4 tasks split into 2 waves.",
-        history,
-      );
+      history = await streamAgent(planner, plannerPrompt, history);
     } catch (e: any) {
       history.push({ role: "assistant", content: `\u274C Planner error: ${e.message}` });
     }
 
-    history.push({
-      role: "assistant",
-      content: `---\n\n${MOCK_SPEC}\n\n---\n\n**Approve?** \`approve\` / \`revise: <feedback>\``,
-    });
+    const parsed = parsePlannerOutput(history);
+    if (parsed) {
+      PENDING_PLAN = parsed;
+      const cardTable = parsed.cards
+        .map((c, i) => `| ${i + 1} | ${c.title} | ${c.wave} | \`card-${i + 1}-${c.slug}\` |`)
+        .join("\n");
+      history.push({
+        role: "assistant",
+        content:
+          `---\n\n**Sprint: ${parsed.name}** (${parsed.cards.length} cards)\n\n` +
+          `| # | Title | Wave | Branch |\n|---|-------|------|--------|\n${cardTable}\n\n` +
+          `---\n\n**Approve?** \`approve\` / \`revise: <feedback>\``,
+      });
+    } else {
+      history.push({
+        role: "assistant",
+        content: `---\n\n\u26A0\uFE0F Could not parse structured plan from Planner output.\nReview the spec above and try \`/plan\` again, or manually create a plan.`,
+      });
+    }
     orchestratorHistory = history;
     pushFullState(history);
     return history;
   }
 
-  // approve
+  // revise: <feedback> — re-invoke Planner
+  if (msg.startsWith("revise:") || msg.startsWith("revise ")) {
+    const feedback = message.trim().slice(message.indexOf(":") + 1 || message.indexOf(" ") + 1).trim();
+    const planner = getOrCreateSession("planner", "Planner");
+    try {
+      history = await streamAgent(planner, `Revise the plan based on this feedback: ${feedback}`, history);
+    } catch (e: any) {
+      history.push({ role: "assistant", content: `\u274C Planner error: ${e.message}` });
+    }
+    const parsed = parsePlannerOutput(history);
+    if (parsed) PENDING_PLAN = parsed;
+    history.push({ role: "assistant", content: `---\n\n**Approve?** \`approve\` / \`revise: <feedback>\`` });
+    orchestratorHistory = history;
+    pushFullState(history);
+    return history;
+  }
+
+  // approve — create sprint from PENDING_PLAN
   if (msg === "approve") {
+    if (!PENDING_PLAN) {
+      history.push({ role: "assistant", content: "\u26A0\uFE0F No plan to approve. Run \`/plan\` first." });
+      orchestratorHistory = history;
+      pushFullState(history);
+      return history;
+    }
+
     EVENT_LOG.append("orchestrator", "sprint_start");
-    log("sprint_start", "orchestrator", "approve \u2192 wave flow");
+    log("sprint_start", "orchestrator", `approve \u2192 ${PENDING_PLAN.name}`);
 
     SPRINT_PLAN = {
-      name: "iter-11",
-      cards: [
-        createCard(1, "Fix route planning", "fix-route", 1, ["Distance calc within 50m", "3 new tests"]),
-        createCard(2, "Add SSE streaming", "add-sse", 1, ["EventSource endpoint", "200ms delivery"]),
-        createCard(3, "Refactor executor", "refactor-exec", 2, ['Extract _build_params()', "Method <10 lines"]),
-        createCard(4, "Update frontend map", "update-map", 2, ["SSE integration", "Loading skeleton"]),
-      ],
+      name: PENDING_PLAN.name,
+      cards: PENDING_PLAN.cards.map((c, i) => createCard(i + 1, c.title, c.slug, c.wave, c.ac)),
     };
+    PENDING_PLAN = null;
 
     for (const waveNum of allWaves(SPRINT_PLAN)) {
       const waveCards = getWave(SPRINT_PLAN, waveNum);
@@ -333,56 +566,9 @@ async function orchestratorChat(message: string, history: ChatMessage[]): Promis
         log("review", reviewerName, `card ${card.id}`);
       }
 
-      // Phase 3: Verify + Route
+      // Phase 3: Verify + Route (with re-execution support)
       for (const card of waveCards) {
-        let executorSummary = "";
-        for (let i = history.length - 1; i >= 0; i--) {
-          const entry = history[i];
-          if (entry.role === "assistant" && entry.content.includes(`executor-${card.slug}`)) {
-            executorSummary = entry.content.slice(0, 500);
-            break;
-          }
-        }
-
-        const verifierPrompt = buildVerifierPrompt(card.acceptanceCriteria, "", executorSummary);
-        let vResult: { approved: boolean; acResults: any[]; issues: string[] };
-        try {
-          const vRaw = await callOneshot("Verifier", verifierPrompt);
-          vResult = parseVerifierResponse(vRaw);
-        } catch {
-          vResult = { approved: true, acResults: [], issues: [] };
-        }
-
-        const routerPrompt = buildRouterPrompt(
-          card.title,
-          vResult.approved ? "approve" : "request_changes",
-          1,
-          JSON.stringify(vResult),
-        );
-        let rResult: { decision: string; reason: string };
-        try {
-          const rRaw = await callOneshot("Router", routerPrompt);
-          rResult = parseRouterResponse(rRaw);
-        } catch {
-          rResult = { decision: "merge", reason: "default" };
-        }
-
-        const vIcon = vResult.approved ? "\u2713" : "\u2717";
-        history.push({
-          role: "assistant",
-          content:
-            `---\n${vIcon} **Verifier** Card ${card.id}: ${vResult.approved ? "approved" : "issues found"}\n` +
-            `\uD83D\uDD00 **Router** Card ${card.id}: \`${rResult.decision}\` \u2014 ${rResult.reason}\n---`,
-        });
-
-        EVENT_LOG.append("verifier", "check", { card: card.id, approved: vResult.approved });
-        EVENT_LOG.append("router", "decide", { card: card.id, decision: rResult.decision });
-
-        if (rResult.decision === "merge") card.status = "merged";
-        else if (rResult.decision === "escalate_to_human") card.status = "blocked";
-        else card.status = "merged";
-
-        pushFullState(history);
+        history = await verifyAndRoute(card, history);
       }
 
       // Phase 4: Test merged cards
@@ -436,7 +622,7 @@ async function orchestratorChat(message: string, history: ChatMessage[]): Promis
         renderSprintBoard(SPRINT_PLAN) +
         "\n\n*All waves executed, reviewed, merged, and tested.*\n\n---\n\n" +
         "**Deploy?** Orchestrator will tag and push to trigger CI deploy.\n\n" +
-        "`deploy` \u2014 tag + push (triggers production deploy)\n" +
+        "`deploy` \u2014 preview tag + confirm\n" +
         "`skip-deploy` \u2014 done, don't deploy yet",
     });
     EVENT_LOG.append("orchestrator", "sprint_complete");
@@ -445,19 +631,43 @@ async function orchestratorChat(message: string, history: ChatMessage[]): Promis
     return history;
   }
 
-  // deploy
+  // deploy — preview what will happen
   if (msg === "deploy" && SPRINT_PLAN) {
+    const { latest, next } = computeNextTag();
     history.push({
       role: "assistant",
       content:
-        "\uD83D\uDE80 **Deploying...**\n\n```\n" +
-        "LATEST=$(git tag --sort=-v:refname | head -1)\n" +
-        "NEXT=$(echo $LATEST | awk -F. '{print $1\".\"$2\".\"$3+1}')\n" +
-        "git tag $NEXT && git push origin $NEXT\n" +
-        "```\n\n*(Orchestrator runs this, not the Tester agent.)*\nCI deploy triggered. Sprint done.",
+        `\uD83D\uDE80 **Deploy preview:**\n` +
+        `- Latest tag: \`${latest}\`\n` +
+        `- Next tag: \`${next}\`\n` +
+        `- Will run: \`git tag ${next} && git push origin ${next}\`\n\n` +
+        `**Confirm?** \`confirm-deploy\` / \`skip-deploy\``,
     });
-    EVENT_LOG.append("orchestrator", "deploy");
-    log("deploy", "orchestrator", "version tagged");
+    orchestratorHistory = history;
+    pushFullState(history);
+    return history;
+  }
+
+  // confirm-deploy — actually tag and push
+  if (msg === "confirm-deploy" && SPRINT_PLAN) {
+    const { next } = computeNextTag();
+    const tagResult = Bun.spawnSync(["git", "tag", next]);
+    if (tagResult.exitCode !== 0) {
+      history.push({ role: "assistant", content: `\u274C Could not create tag \`${next}\`: ${tagResult.stderr.toString().trim()}` });
+      orchestratorHistory = history;
+      pushFullState(history);
+      return history;
+    }
+    const pushResult = Bun.spawnSync(["git", "push", "origin", next]);
+    if (pushResult.exitCode !== 0) {
+      history.push({ role: "assistant", content: `\u274C Could not push tag \`${next}\`: ${pushResult.stderr.toString().trim()}` });
+      orchestratorHistory = history;
+      pushFullState(history);
+      return history;
+    }
+    history.push({ role: "assistant", content: `\u2705 **Deployed \`${next}\`.** CI triggered. Sprint done.` });
+    EVENT_LOG.append("orchestrator", "deploy", { tag: next });
+    log("deploy", "orchestrator", `tagged ${next}`);
     orchestratorHistory = history;
     pushFullState(history);
     return history;
@@ -466,6 +676,36 @@ async function orchestratorChat(message: string, history: ChatMessage[]): Promis
   // skip-deploy
   if (msg === "skip-deploy" && SPRINT_PLAN) {
     history.push({ role: "assistant", content: "\u23ED\uFE0F Deploy skipped. Sprint complete without deploy." });
+    orchestratorHistory = history;
+    pushFullState(history);
+    return history;
+  }
+
+  // resolve <cardId> — unblock escalated card
+  if (msg.startsWith("resolve ") && SPRINT_PLAN) {
+    const cardId = parseInt(msg.split(" ")[1], 10);
+    const card = SPRINT_PLAN.cards.find((c) => c.id === cardId);
+    if (card && card.status === "blocked") {
+      card.status = "merged";
+      history.push({ role: "assistant", content: `\u2705 Card ${cardId} resolved \u2192 merged.` });
+    } else {
+      history.push({ role: "assistant", content: `\u26A0\uFE0F Card ${cardId} not found or not blocked.` });
+    }
+    orchestratorHistory = history;
+    pushFullState(history);
+    return history;
+  }
+
+  // skip <cardId> — skip blocked card
+  if (msg.startsWith("skip ") && SPRINT_PLAN) {
+    const cardId = parseInt(msg.split(" ")[1], 10);
+    const card = SPRINT_PLAN.cards.find((c) => c.id === cardId);
+    if (card) {
+      card.status = "skipped";
+      history.push({ role: "assistant", content: `\u23ED\uFE0F Card ${cardId} skipped.` });
+    } else {
+      history.push({ role: "assistant", content: `\u26A0\uFE0F Card ${cardId} not found.` });
+    }
     orchestratorHistory = history;
     pushFullState(history);
     return history;
