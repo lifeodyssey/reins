@@ -1,0 +1,15 @@
+{
+  "name": "claude-plugin-reins",
+  "version": "0.1.0",
+  "description": "Multi-agent sprint orchestrator for Claude Code",
+  "keywords": ["claude-code-plugin", "harness", "orchestrator", "multi-agent", "sprint"],
+  "license": "MIT",
+  "files": [
+    ".claude-plugin/",
+    "commands/",
+    "agents/",
+    "skills/",
+    "hooks/",
+    "scripts/"
+  ]
+}

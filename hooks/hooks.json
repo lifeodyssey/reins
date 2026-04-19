@@ -1,0 +1,14 @@
+{
+  "hooks": [
+    {
+      "event": "PreToolUse",
+      "matcher": "Write|Edit",
+      "command": "bash $CLAUDE_PLUGIN_ROOT/hooks/scripts/check-write.sh"
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Bash",
+      "command": "bash $CLAUDE_PLUGIN_ROOT/hooks/scripts/check-bash.sh"
+    }
+  ]
+}
