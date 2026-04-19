@@ -9,31 +9,85 @@ permissions:
   contents: write
 
 jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: reins-macos-arm64
+          - os: macos-13
+            artifact: reins-macos-x64
+          - os: ubuntu-latest
+            artifact: reins-linux-x64
+          - os: windows-latest
+            artifact: reins-windows-x64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install gradio claude-agent-sdk "httpx[socks]"
+
+      - name: Build with Nuitka
+        uses: Nuitka/Nuitka-Action@main
+        with:
+          nuitka-version: main
+          script-name: plugins/reins/scripts/gradio-ui.py
+          standalone: true
+          onefile: true
+          output-file: ${{ matrix.artifact }}
+          include-data-dir: plugins/reins/scripts=scripts
+          enable-plugins: anti-bloat
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: build/${{ matrix.artifact }}*
+
   release:
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Extract version from tag
-        id: version
-        run: |
-          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
-          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Verify version matches package.json
-        env:
-          TAG_VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          PKG_VERSION=$(jq -r .version package.json)
-          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
-            echo "ERROR: package.json version ($PKG_VERSION) != tag version ($TAG_VERSION)"
-            exit 1
-          fi
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          files: |
+            dist/reins-macos-arm64/*
+            dist/reins-macos-x64/*
+            dist/reins-linux-x64/*
+            dist/reins-windows-x64/*
+          body: |
+            ## Install
+
+            ### As Claude Code plugin (recommended)
+            ```bash
+            claude plugin marketplace add lifeodyssey/reins
+            claude plugin install reins
+            ```
+
+            ### As standalone binary
+            Download the binary for your platform below, then:
+            ```bash
+            chmod +x reins-*     # macOS/Linux
+            ./reins-macos-arm64  # or reins-linux-x64, reins-windows-x64.exe
+            ```
+            Opens http://localhost:7860 with the orchestrator UI.
+
+            **Requires:** [Claude Code CLI](https://claude.ai/code) installed and authenticated.
 
   publish-npm:
     runs-on: ubuntu-latest
@@ -48,6 +102,8 @@ jobs:
           registry-url: https://registry.npmjs.org
 
       - name: Publish to npm
-        run: npm publish --access public
+        run: |
+          cd plugins/reins
+          npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
