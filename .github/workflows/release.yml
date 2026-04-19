@@ -16,9 +16,6 @@ jobs:
           - os: macos-latest
             target: bun-darwin-arm64
             artifact: reins-macos-arm64
-          - os: macos-13
-            target: bun-darwin-x64
-            artifact: reins-macos-x64
           - os: ubuntu-latest
             target: bun-linux-x64
             artifact: reins-linux-x64
@@ -63,7 +60,6 @@ jobs:
           generate_release_notes: true
           files: |
             dist/reins-macos-arm64/*
-            dist/reins-macos-x64/*
             dist/reins-linux-x64/*
             dist/reins-windows-x64/*
           body: |
