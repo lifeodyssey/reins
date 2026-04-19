@@ -75,6 +75,26 @@ function pushFullState(history: ChatMessage[]): void {
 }
 
 // ---------------------------------------------------------------------------
+// Find system Claude CLI (compiled binary can't use node_modules native)
+// ---------------------------------------------------------------------------
+function findClaudePath(): string | undefined {
+  const result = Bun.spawnSync(["which", "claude"]);
+  const path = result.stdout.toString().trim();
+  return path || undefined;
+}
+
+const CLAUDE_PATH = findClaudePath();
+
+function sdkOptions(opts: ReturnType<typeof getAgentOptions>) {
+  return {
+    model: opts.model,
+    systemPrompt: opts.systemPrompt,
+    allowedTools: opts.allowedTools,
+    ...(CLAUDE_PATH ? { pathToClaudeCodeExecutable: CLAUDE_PATH } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // SDK query helper
 // ---------------------------------------------------------------------------
 async function runQuery(
@@ -84,11 +104,7 @@ async function runQuery(
   const { query } = await import("@anthropic-ai/claude-agent-sdk");
   const q = query({
     prompt,
-    options: {
-      model: opts.model,
-      systemPrompt: opts.systemPrompt,
-      allowedTools: opts.allowedTools,
-    },
+    options: sdkOptions(opts),
   });
   const messages: any[] = [];
   for await (const msg of q) {
@@ -131,11 +147,7 @@ async function streamAgent(session: AgentSession, task: string, history: ChatMes
   const opts = getAgentOptions(session.agentType);
   const q = query({
     prompt: task,
-    options: {
-      model: opts.model,
-      systemPrompt: opts.systemPrompt,
-      allowedTools: opts.allowedTools,
-    },
+    options: sdkOptions(opts),
   });
 
   // Store the Query handle so we can interrupt it
