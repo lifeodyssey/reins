@@ -37,7 +37,7 @@ Orchestrator (Python state machine, scripts/gradio-ui.py)
   │
   ├── Executor (ClaudeSDKClient session)  → agents/executor.md
   ├── Reviewer (ClaudeSDKClient session)  → agents/reviewer.md
-  ├── Tester   (ClaudeSDKClient session)  → agents/tester.md
+  ├── Tester   (ClaudeSDKClient session)  → agents/tester.md (tests running app, writes automated tests, tags for deploy)
   ├── Planner  (ClaudeSDKClient session)  → agents/planner.md
   └── Designer (ClaudeSDKClient session)  → agents/designer.md
 ```
