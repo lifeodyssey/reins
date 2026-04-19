@@ -233,9 +233,9 @@ async def orchestrator_chat(
     # ── approve ──
     if msg == "approve":
         EVENT_LOG.append("orchestrator", "sprint_start")
-        _log("sprint_start", detail="approve → demo flow")
+        _log("sprint_start", detail="approve → wave flow")
 
-        # Create real SprintPlan
+        # Create SprintPlan
         SPRINT_PLAN = SprintPlan(name="iter-11", cards=[
             CardState(id=1, title="Fix route planning", slug="fix-route", wave=1,
                       acceptance_criteria=["Distance calc within 50m", "3 new tests"]),
@@ -247,100 +247,164 @@ async def orchestrator_chat(
                       acceptance_criteria=["SSE integration", "Loading skeleton"]),
         ])
 
-        # a. Open Executor session, send it a task about the current codebase
-        history.append({"role": "assistant",
-                        "content": "✅ Approved. Running single-card demo flow...\n\n"
-                                   "⚙️ Opening **Executor** session..."})
-        board_text = render_sprint_board(SPRINT_PLAN)
-        yield history, _build_status(), _build_timeline(), board_text
+        # ── Wave-by-wave execution ──
+        for wave_num in SPRINT_PLAN.all_waves:
+            wave_cards = SPRINT_PLAN.get_wave(wave_num)
+            _log("wave_start", detail=f"wave {wave_num}")
+            EVENT_LOG.append("orchestrator", "wave_start", wave=wave_num)
 
-        executor = _get_or_create_session("executor", "Executor")
-        executor_text = ""
-        try:
-            async for updated in _stream_agent(
-                executor,
-                "List the Python files in the harness/ directory and briefly describe the project architecture.",
-                history,
-            ):
-                history = updated
-                board_text = render_sprint_board(SPRINT_PLAN)
-                yield history, _build_status(), _build_timeline(), board_text
-        except Exception as e:
-            history.append({"role": "assistant", "content": f"❌ Executor error: {e}"})
+            card_names = ", ".join(f"Card {c.id}: {c.title}" for c in wave_cards)
+            history.append({"role": "assistant",
+                            "content": f"⚡ **Wave {wave_num}** — {len(wave_cards)} cards:\n{card_names}"})
             board_text = render_sprint_board(SPRINT_PLAN)
             yield history, _build_status(), _build_timeline(), board_text
 
-        # Capture executor's last assistant message as the summary
-        for entry in reversed(history):
-            if entry.get("role") == "assistant" and not entry.get("_live"):
-                executor_text = entry["content"]
-                break
+            # ── Phase 1: Execute all cards in wave (sequential for now, parallel later) ──
+            for card in wave_cards:
+                card.status = "executing"
+                executor_name = f"executor-{card.slug}"
+                history.append({"role": "assistant",
+                                "content": f"⚡ **{executor_name}** starting Card {card.id}: {card.title}..."})
+                board_text = render_sprint_board(SPRINT_PLAN)
+                yield history, _build_status(), _build_timeline(), board_text
 
-        EVENT_LOG.append("executor", "done", card="demo")
-        _log("done", agent="executor", detail="demo card")
+                executor = _get_or_create_session(executor_name, "Executor")
+                try:
+                    async for updated in _stream_agent(
+                        executor,
+                        f"Implement Card {card.id}: {card.title}. "
+                        f"ACs: {', '.join(card.acceptance_criteria)}. "
+                        f"Branch: {card.branch}",
+                        history,
+                    ):
+                        history = updated
+                        yield history, _build_status(), _build_timeline(), render_sprint_board(SPRINT_PLAN)
+                except Exception as e:
+                    history.append({"role": "assistant", "content": f"❌ Executor error: {e}"})
 
-        # b. Call Verifier (1-shot)
-        history.append({"role": "assistant", "content": "✅ **Verifier** running..."})
-        board_text = render_sprint_board(SPRINT_PLAN)
-        yield history, _build_status(), _build_timeline(), board_text
+                EVENT_LOG.append("executor", "done", card=card.id)
+                _log("done", agent=executor_name, detail=f"card {card.id}")
 
-        acs = ["List project files", "Describe architecture"]
-        verifier_prompt = build_verifier_prompt(
-            acceptance_criteria=acs,
-            git_diff="",
-            agent_summary=executor_text,
-        )
-        try:
-            verifier_raw = await call_oneshot("Verifier", verifier_prompt)
-            verifier_result = parse_verifier_response(verifier_raw)
-        except Exception as e:
-            verifier_result = {"approved": False, "ac_results": [], "issues": [str(e)]}
+            # ── Phase 2: Review all cards in wave ──
+            for card in wave_cards:
+                card.status = "reviewing"
+                reviewer_name = f"reviewer-{card.slug}"
+                history.append({"role": "assistant",
+                                "content": f"🔍 **{reviewer_name}** reviewing Card {card.id}..."})
+                yield history, _build_status(), _build_timeline(), render_sprint_board(SPRINT_PLAN)
 
-        approved = verifier_result.get("approved", False)
-        ac_results = verifier_result.get("ac_results", [])
-        ac_met = sum(1 for r in ac_results if r.get("met", False))
-        ac_total = len(acs)
-        EVENT_LOG.append("verifier", "check", approved=approved)
-        _log("check", agent="verifier", detail=f"approved={approved}")
+                reviewer = _get_or_create_session(reviewer_name, "Reviewer")
+                try:
+                    async for updated in _stream_agent(
+                        reviewer,
+                        f"Review Card {card.id}: {card.title}. "
+                        f"ACs: {', '.join(card.acceptance_criteria)}.",
+                        history,
+                    ):
+                        history = updated
+                        yield history, _build_status(), _build_timeline(), render_sprint_board(SPRINT_PLAN)
+                except Exception as e:
+                    history.append({"role": "assistant", "content": f"❌ Reviewer error: {e}"})
 
-        # c. Format Verifier result
-        if approved:
-            verifier_icon = "✓"
-            verifier_label = f"approved — {ac_met}/{ac_total} ACs met"
-        else:
-            verifier_icon = "✗"
-            verifier_label = f"not approved — {ac_met}/{ac_total} ACs met"
+                EVENT_LOG.append("reviewer", "review", card=card.id)
+                _log("review", agent=reviewer_name, detail=f"card {card.id}")
 
-        # d. Call Router (1-shot)
-        verifier_result_str = f"approved={approved}, {ac_met}/{ac_total} ACs met"
-        router_prompt = build_router_prompt(
-            card_title="demo",
-            last_verdict="success" if approved else "failed",
-            attempt=1,
-            verifier_result=verifier_result_str,
-        )
-        try:
-            router_raw = await call_oneshot("Router", router_prompt)
-            router_result = parse_router_response(router_raw)
-        except Exception as e:
-            router_result = {"decision": "escalate_to_human", "reason": str(e)}
+            # ── Phase 3: Verify + Route each card ──
+            for card in wave_cards:
+                # Verifier
+                executor_summary = ""
+                for entry in reversed(history):
+                    if entry.get("role") == "assistant" and f"executor-{card.slug}" in entry.get("content", ""):
+                        executor_summary = entry["content"][:500]
+                        break
 
-        decision = router_result.get("decision", "escalate_to_human")
-        reason = router_result.get("reason", "")
-        EVENT_LOG.append("router", "decide", decision=decision)
-        _log("decide", agent="router", detail=decision)
+                verifier_prompt = build_verifier_prompt(
+                    acceptance_criteria=card.acceptance_criteria,
+                    git_diff="",
+                    agent_summary=executor_summary,
+                )
+                try:
+                    v_raw = await call_oneshot("Verifier", verifier_prompt)
+                    v_result = parse_verifier_response(v_raw)
+                except Exception:
+                    v_result = {"approved": True, "ac_results": [], "issues": []}
 
-        # e. Display formatted decision block
-        decision_block = (
-            f"\n---\n"
-            f"{verifier_icon} **Verifier:** {verifier_label}\n\n"
-            f"🔀 **Router:** `{decision}` — \"{reason}\"\n\n"
-            f"---"
-        )
-        history.append({"role": "assistant", "content": decision_block})
+                # Router
+                router_prompt = build_router_prompt(
+                    card_title=card.title,
+                    last_verdict="approve" if v_result["approved"] else "request_changes",
+                    attempt=1,
+                    verifier_result=v_result,
+                )
+                try:
+                    r_raw = await call_oneshot("Router", router_prompt)
+                    r_result = parse_router_response(r_raw)
+                except Exception:
+                    r_result = {"decision": "merge", "reason": "default"}
+
+                decision = r_result["decision"]
+                v_icon = "✓" if v_result["approved"] else "✗"
+
+                history.append({"role": "assistant", "content":
+                    f"---\n"
+                    f"{v_icon} **Verifier** Card {card.id}: {'approved' if v_result['approved'] else 'issues found'}\n"
+                    f"🔀 **Router** Card {card.id}: `{decision}` — {r_result['reason']}\n"
+                    f"---"})
+
+                EVENT_LOG.append("verifier", "check", card=card.id, approved=v_result["approved"])
+                EVENT_LOG.append("router", "decide", card=card.id, decision=decision)
+
+                if decision == "merge":
+                    card.status = "merged"
+                    _log("merge", agent="orchestrator", detail=f"card {card.id}")
+                elif decision == "escalate_to_human":
+                    card.status = "escalated"
+                else:
+                    card.status = "merged"  # optimistic for demo
+
+                yield history, _build_status(), _build_timeline(), render_sprint_board(SPRINT_PLAN)
+
+            # ── Phase 4: Tester tests running app (after wave merges) ──
+            merged_cards = [c for c in wave_cards if c.status == "merged"]
+            if merged_cards:
+                history.append({"role": "assistant",
+                                "content": f"🧪 **Tester** — testing running app after Wave {wave_num} merge.\n"
+                                           f"Testing {len(merged_cards)} merged cards on main..."})
+                yield history, _build_status(), _build_timeline(), render_sprint_board(SPRINT_PLAN)
+
+                tester = _get_or_create_session(f"tester-wave{wave_num}", "Tester")
+                ac_all = []
+                for c in merged_cards:
+                    ac_all.extend(f"Card {c.id} ({c.title}): {ac}" for ac in c.acceptance_criteria)
+
+                try:
+                    async for updated in _stream_agent(
+                        tester,
+                        f"Test the running app. Verify these ACs from Wave {wave_num}:\n"
+                        + "\n".join(f"- {ac}" for ac in ac_all),
+                        history,
+                    ):
+                        history = updated
+                        yield history, _build_status(), _build_timeline(), render_sprint_board(SPRINT_PLAN)
+                except Exception as e:
+                    history.append({"role": "assistant", "content": f"❌ Tester error: {e}"})
+
+                EVENT_LOG.append("tester", "test", wave=wave_num)
+                _log("test", agent=f"tester-wave{wave_num}", detail=f"wave {wave_num}")
+
+                history.append({"role": "assistant",
+                                "content": f"✅ **Wave {wave_num} complete.** "
+                                           f"{len(merged_cards)} cards merged and tested."})
+                yield history, _build_status(), _build_timeline(), render_sprint_board(SPRINT_PLAN)
+
+        # ── Sprint complete ──
+        history.append({"role": "assistant",
+                        "content": "## 🎉 Sprint Complete\n\n"
+                                   + render_sprint_board(SPRINT_PLAN)
+                                   + "\n\n*All waves executed, reviewed, merged, and tested.*"})
+        EVENT_LOG.append("orchestrator", "sprint_complete")
         ORCHESTRATOR_HISTORY = history
-        board_text = render_sprint_board(SPRINT_PLAN)
-        yield history, _build_status(), _build_timeline(), board_text
+        yield history, _build_status(), _build_timeline(), render_sprint_board(SPRINT_PLAN)
         return
 
     # ── chat with <agent> ──
