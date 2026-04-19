@@ -6,3 +6,7 @@ __pycache__/
 *.egg-info/
 dist/
 node_modules/
+bun.lockb
+package-lock.json
+reins
+reins.exe

@@ -14,40 +14,37 @@ jobs:
       matrix:
         include:
           - os: macos-latest
+            target: bun-darwin-arm64
             artifact: reins-macos-arm64
           - os: macos-13
+            target: bun-darwin-x64
             artifact: reins-macos-x64
           - os: ubuntu-latest
+            target: bun-linux-x64
             artifact: reins-linux-x64
           - os: windows-latest
+            target: bun-windows-x64
             artifact: reins-windows-x64
 
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: oven-sh/setup-bun@v2
         with:
-          python-version: "3.13"
+          bun-version: latest
 
       - name: Install dependencies
-        run: pip install gradio claude-agent-sdk "httpx[socks]"
+        run: cd plugins/reins && bun install
 
-      - name: Build with Nuitka
-        uses: Nuitka/Nuitka-Action@main
-        with:
-          nuitka-version: main
-          script-name: plugins/reins/scripts/gradio-ui.py
-          mode: onefile
-          output-file: ${{ matrix.artifact }}
-          include-data-dir: plugins/reins/scripts=scripts
-          enable-plugins: anti-bloat
+      - name: Build binary
+        run: cd plugins/reins && bun build --compile --target=${{ matrix.target }} src/server.ts --outfile ${{ matrix.artifact }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: build/${{ matrix.artifact }}*
+          path: plugins/reins/${{ matrix.artifact }}*
 
   release:
     needs: build
