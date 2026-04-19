@@ -38,8 +38,7 @@ jobs:
         with:
           nuitka-version: main
           script-name: plugins/reins/scripts/gradio-ui.py
-          standalone: true
-          onefile: true
+          mode: onefile
           output-file: ${{ matrix.artifact }}
           include-data-dir: plugins/reins/scripts=scripts
           enable-plugins: anti-bloat
