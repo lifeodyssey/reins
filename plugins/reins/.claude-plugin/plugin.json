@@ -1,7 +1,7 @@
 {
   "name": "reins",
-  "version": "0.6.0",
-  "description": "Harness engineering framework for Claude Code. Multi-agent sprint orchestrator with Planner, Executor, Reviewer, and Tester agents \u2014 live streaming, interrupt, direct chat, and permission hooks.",
+  "version": "0.7.0",
+  "description": "Harness engineering framework for Claude Code. Multi-agent sprint orchestrator with Planner, PM, Executor, Codex Reviewer, Reviewer, and Tester agents \u2014 state-driven ReAct loop, context isolation, GitHub PR lifecycle, live streaming.",
   "author": {
     "name": "lumimamini"
   },

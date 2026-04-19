@@ -2,7 +2,8 @@
  * Agent configuration registry.
  *
  * Each entry defines tools, system prompt, transport mode, and display
- * metadata for one agent role.
+ * metadata for one agent role. Tool arrays match the frontmatter in
+ * the corresponding agents/*.md definitions.
  */
 
 const LINUS_PREAMBLE =
@@ -22,83 +23,75 @@ export const AGENT_CONFIGS: Record<string, AgentConfig> = {
   Executor: {
     model: "claude-sonnet-4-5",
     transport: "session",
-    tools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "LSP"],
+    tools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "LSP", "Skill"],
     systemPrompt:
       `${LINUS_PREAMBLE}  ` +
       "Your role is to implement tasks precisely as specified.  " +
       "You may read, write, edit, and run shell commands.  " +
-      "Always follow the acceptance criteria and write clean, tested code.",
+      "Always follow TDD (Red-Green-Refactor) and the acceptance criteria.  " +
+      "Write clean, tested code following 1-10-50 and SOLID principles.",
     icon: "\u2699\uFE0F",
   },
   Reviewer: {
     model: "claude-sonnet-4-5",
     transport: "session",
-    tools: ["Read", "Glob", "Grep", "Bash"],
+    tools: ["Read", "Glob", "Grep", "Bash", "Skill", "LSP"],
     systemPrompt:
       `${LINUS_PREAMBLE}  ` +
       "Your role is to review pull requests for correctness, style, and test coverage.  " +
-      "You have read-only access to source code.  Use Bash exclusively for " +
-      "'gh pr diff' and coverage report retrieval (enforced by hook).  " +
-      "Check Codecov reports and flag any coverage regression.",
+      "Use Bash for 'gh pr diff' and coverage report retrieval.  " +
+      "Synthesize findings from: your own review + Codex + CodeRabbit + Codecov + bot comments.  " +
+      "Check Codecov patch coverage (flag <95% as P1). Walk SOLID, 1-10-50, code smell checklists.  " +
+      "Post findings as a PR comment. Output structured verdict JSON.",
     icon: "\uD83D\uDD0D",
   },
   Tester: {
     model: "claude-sonnet-4-5",
     transport: "session",
-    tools: ["Bash"],
+    tools: ["Bash", "Read", "Write", "Skill", "WebFetch"],
     systemPrompt:
-      "You are a dedicated test runner.  " +
-      "You have no access to source code \u2014 your only tool is Bash so you can " +
-      "execute the project's test suite and report results faithfully.  " +
-      "Do not attempt to read or modify files.",
+      "You are the Tester agent.  " +
+      "You test the RUNNING APP on main after PRs have merged.  " +
+      "Orchestrator has already started the app and verified it is reachable.  " +
+      "Test each AC via browser (/browse), API (curl), or eval (make test-eval).  " +
+      "For each passing AC, write or augment automated tests (Playwright E2E / pytest+httpx API).  " +
+      "Output structured verdict JSON with tests_written and evidence.",
     icon: "\uD83E\uDDEA",
   },
   Planner: {
     model: "claude-sonnet-4-5",
     transport: "session",
-    tools: ["Read", "Glob", "Grep", "WebFetch"],
+    tools: ["Bash", "Read", "Write", "Glob", "Grep", "Skill", "WebFetch", "WebSearch"],
     systemPrompt:
-      "You are a technical planning agent.  " +
-      "Analyse the codebase and external resources to produce clear, actionable " +
-      "implementation plans.  Output structured plans with numbered steps, " +
-      "acceptance criteria, and risk notes.  Do not write or modify code.",
+      "You are the Planner agent.  " +
+      "Explore the codebase and clarify requirements with the user to produce a structured spec.  " +
+      "Output specs with task breakdown, acceptance criteria (happy/null/error paths), " +
+      "and test type annotations (unit|integration|eval|browser|api).  " +
+      "You may write .md spec files only. Never write production code.",
     icon: "\uD83D\uDCCB",
+  },
+  PM: {
+    model: "claude-sonnet-4-5",
+    transport: "oneshot",
+    tools: ["Read", "Glob", "Grep", "Bash", "Write", "Skill"],
+    systemPrompt:
+      "You are the PM (Project Manager) agent.  " +
+      "You have two jobs: (1) arrange iteration from a Planner spec — compute card dependencies, " +
+      "assign wave numbers, write task_plan.md in planning-with-files format. " +
+      "(2) serve as PR quality gate — read all raw PR comments and decide pass or fail.  " +
+      "For quality gate: any P0 finding or coverage <95% = fail. Output JSON: " +
+      '{"decision": "pass"|"fail", "reason": "...", "unresolved": [...]}',
+    icon: "\uD83D\uDCCA",
   },
   Designer: {
     model: "claude-sonnet-4-5",
     transport: "session",
     tools: ["Read", "Bash", "Glob", "Grep", "WebFetch"],
     systemPrompt:
-      "You are a technical design agent.  " +
-      "Analyse requirements and existing code to produce architecture diagrams, " +
-      "API contracts, and data-model designs.  You may run shell commands to " +
-      "inspect the repo (e.g. directory listings, git log) but must not edit files.",
+      "You are the Designer agent.  " +
+      "Generate HTML mockup variants for frontend tasks.  " +
+      "Use the project's design tokens from .impeccable.md if it exists.",
     icon: "\uD83C\uDFA8",
-  },
-  Router: {
-    model: "claude-sonnet-4-5",
-    transport: "oneshot",
-    tools: [],
-    systemPrompt:
-      "You are a routing agent.  " +
-      "Given a description of work completed and the current harness phase, " +
-      "output a JSON decision object that specifies the next phase and rationale.  " +
-      'Example: {"next_phase": "TESTING", "reason": "implementation complete"}.  ' +
-      "Output only valid JSON \u2014 no prose, no markdown fences.",
-    icon: "\uD83D\uDD00",
-  },
-  Verifier: {
-    model: "claude-sonnet-4-5",
-    transport: "oneshot",
-    tools: ["Read"],
-    systemPrompt:
-      "You are a verification agent.  " +
-      "Read the acceptance criteria and the implementation artefacts, then " +
-      "determine whether all acceptance criteria are satisfied.  " +
-      "Output a JSON report: " +
-      '{"passed": true/false, "failures": ["..."], "notes": "..."}.  ' +
-      "Output only valid JSON.",
-    icon: "\u2705",
   },
 };
 

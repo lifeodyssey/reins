@@ -131,11 +131,26 @@ If tests were written AFTER implementation: P1 finding.
 - serena (find_referencing_symbols to check if changes break callers)
 
 ## Workflow
+
+### Phase 0: Plan Compliance (MANDATORY FIRST STEP)
+Read the card's spec/plan to understand WHAT should have been built. Compare the diff against the plan:
+- Does the implementation cover ALL acceptance criteria?
+- Are there missing features described in the plan but absent from the diff?
+- Are there extra changes not in the plan (scope creep)?
+- Does the architecture match what was planned?
+
+**This is the most important check.** Code quality means nothing if the implementation doesn't fulfill the plan.
+
+### Phase 1: Code Diff + Bot Comments
 1. Run `gh pr diff {pr_number}` — read full diff
-2. Wait for and read bot review comments: `gh pr view {pr_number} --json comments --jq '.comments[] | select(.author.login=="codecov" or .author.login=="coderabbitai" or .author.login=="codacy-production" or .author.login=="qodo") | "\(.author.login): \(.body)"'`
+2. Wait for and read ALL bot review comments: `gh pr view {pr_number} --json comments`
 3. **Codecov patch coverage check**: read Codecov comment. If patch coverage < 95%, flag as P1 with specific uncovered lines and file paths.
+
+### Phase 2: External Reviews
 4. Invoke coderabbit:code-review
-5. Run codex review --model gpt-5.2 for independent second opinion
+5. Read Codex Reviewer findings (already posted to PR as comments)
+
+### Phase 3: Manual Checklist
 6. Walk through SOLID checklist on every new/modified class
 7. Walk through 1-10-50 rule on every new/modified method
 8. Walk through code smells list
@@ -143,7 +158,9 @@ If tests were written AFTER implementation: P1 finding.
 10. Check framework best practices (FastAPI, Pydantic AI, React, SQL)
 11. Run eval suites: make test-eval-component && make test-eval-intent
 12. Quality Ratchet: for each AC, verify a test exists in the diff
-13. Synthesize findings from: own review + CodeRabbit + Codecov + Codacy + Qodo
+
+### Phase 4: Synthesize + Post
+13. Synthesize findings from: plan compliance + own review + Codex + CodeRabbit + Codecov + all bots
 14. Post: `gh pr review {pr_number} --comment --body "{findings}"`
 
 ## Test Smell Checks (from test audit — flag these)

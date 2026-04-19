@@ -1,19 +1,16 @@
 /**
  * Reins orchestrator — Bun HTTP + WebSocket server.
  *
- * Entry point: serves the mission-control UI on :7860 and handles
- * all orchestration via WebSocket messages.
- *
- * Uses `query()` from @anthropic-ai/claude-agent-sdk for all agent
- * interactions (both oneshot and session-based).
+ * Pipeline runner: starts subagents + state transitions.
+ * CLI operations (gh/git/curl) are glue code between agent calls.
+ * Only branch logic: PM returns pass/fail → if/else.
  */
 
 import { AGENT_CONFIGS, getAgentOptions } from "./agents";
 import { EventLog } from "./events";
-import { buildRouterPrompt, parseRouterResponse } from "./router";
-import { AgentSession, type ChatMessage } from "./state";
+import { GitHubOps } from "./github";
+import { AgentSession, Phase, type ChatMessage } from "./state";
 import { formatSdkMessage } from "./stream";
-import { buildVerifierPrompt, parseVerifierResponse } from "./verifier";
 import {
   type CardState,
   type SprintPlan,
@@ -32,9 +29,17 @@ const SESSIONS = new Map<string, AgentSession>();
 const TIMELINE: { ts: string; agent: string; action: string; detail: string }[] = [];
 let orchestratorHistory: ChatMessage[] = [];
 const EVENT_LOG = new EventLog(".harness/sprint-events.jsonl");
+const GH = new GitHubOps();
 let SPRINT_PLAN: SprintPlan | null = null;
+let currentPhase: Phase = Phase.IDLE;
 
-// All connected WebSocket clients
+// Pending plan from Planner+PM, awaiting user approval
+interface PendingPlan {
+  name: string;
+  cards: { title: string; slug: string; wave: number; ac: string[]; dependsOn: number[] }[];
+}
+let PENDING_PLAN: PendingPlan | null = null;
+
 const clients = new Set<any>();
 
 // ---------------------------------------------------------------------------
@@ -58,9 +63,7 @@ function log(action: string, agent = "orchestrator", detail = ""): void {
 function broadcast(msg: Record<string, unknown>): void {
   const json = JSON.stringify(msg);
   for (const ws of clients) {
-    try {
-      ws.send(json);
-    } catch {}
+    try { ws.send(json); } catch {}
   }
 }
 
@@ -75,7 +78,7 @@ function pushFullState(history: ChatMessage[]): void {
 }
 
 // ---------------------------------------------------------------------------
-// Find system Claude CLI (compiled binary can't use node_modules native)
+// Claude CLI path (for compiled binary)
 // ---------------------------------------------------------------------------
 function findClaudePath(): string | undefined {
   const result = Bun.spawnSync(["which", "claude"]);
@@ -95,47 +98,28 @@ function sdkOptions(opts: ReturnType<typeof getAgentOptions>) {
 }
 
 // ---------------------------------------------------------------------------
-// SDK query helper
-// ---------------------------------------------------------------------------
-async function runQuery(
-  prompt: string,
-  opts: ReturnType<typeof getAgentOptions>,
-): Promise<{ messages: any[]; queryHandle: any }> {
-  const { query } = await import("@anthropic-ai/claude-agent-sdk");
-  const q = query({
-    prompt,
-    options: sdkOptions(opts),
-  });
-  const messages: any[] = [];
-  for await (const msg of q) {
-    messages.push(msg);
-  }
-  return { messages, queryHandle: q };
-}
-
-// ---------------------------------------------------------------------------
-// 1-shot helper (Router / Verifier)
+// SDK: 1-shot query
 // ---------------------------------------------------------------------------
 async function callOneshot(agentType: string, prompt: string): Promise<string> {
   try {
+    const { query } = await import("@anthropic-ai/claude-agent-sdk");
     const opts = getAgentOptions(agentType);
-    const { messages } = await runQuery(prompt, opts);
     const texts: string[] = [];
-    for (const msg of messages) {
+    for await (const msg of query({ prompt, options: sdkOptions(opts) })) {
       if (msg.type === "assistant") {
-        for (const block of msg.message?.content ?? []) {
+        for (const block of (msg as any).message?.content ?? []) {
           if (block.type === "text") texts.push(block.text);
         }
       }
     }
     return texts.join("\n");
   } catch (e: any) {
-    return JSON.stringify({ decision: "escalate_to_human", reason: e.message });
+    return JSON.stringify({ decision: "fail", reason: e.message });
   }
 }
 
 // ---------------------------------------------------------------------------
-// Stream agent: fire query() and push each message to UI via WebSocket
+// SDK: stream agent to UI via WebSocket
 // ---------------------------------------------------------------------------
 async function streamAgent(session: AgentSession, task: string, history: ChatMessage[]): Promise<ChatMessage[]> {
   session.isStreaming = true;
@@ -145,12 +129,7 @@ async function streamAgent(session: AgentSession, task: string, history: ChatMes
 
   const { query } = await import("@anthropic-ai/claude-agent-sdk");
   const opts = getAgentOptions(session.agentType);
-  const q = query({
-    prompt: task,
-    options: sdkOptions(opts),
-  });
-
-  // Store the Query handle so we can interrupt it
+  const q = query({ prompt: task, options: sdkOptions(opts) });
   session.client = q;
   let currentContent = "";
 
@@ -158,8 +137,6 @@ async function streamAgent(session: AgentSession, task: string, history: ChatMes
     for await (const msg of q) {
       const formatted = formatSdkMessage(msg, session.name);
       if (!formatted) continue;
-
-      // Track tool calls
       if (msg.type === "assistant") {
         for (const block of (msg as any).message?.content ?? []) {
           if (block.type === "tool_use") {
@@ -169,20 +146,15 @@ async function streamAgent(session: AgentSession, task: string, history: ChatMes
           }
         }
       }
-
       currentContent = currentContent ? currentContent + "\n\n" + formatted : formatted;
-
       const config = AGENT_CONFIGS[session.agentType];
       const icon = config?.icon ?? "\uD83E\uDD16";
       const agentBlock = `**${icon} ${session.name}** *(${session.agentType})*\n\n${currentContent}`;
-
-      // Update or append live message
       if (history.length > 0 && history[history.length - 1]._live) {
         history[history.length - 1] = { role: "assistant", content: agentBlock, _live: true };
       } else {
         history.push({ role: "assistant", content: agentBlock, _live: true });
       }
-
       pushFullState(history);
     }
   } catch (err: any) {
@@ -191,11 +163,9 @@ async function streamAgent(session: AgentSession, task: string, history: ChatMes
     pushFullState(history);
   }
 
-  // Finalize live message
   if (history.length > 0 && history[history.length - 1]._live) {
     delete history[history.length - 1]._live;
   }
-
   session.isStreaming = false;
   session.status = "ready";
   session.client = null;
@@ -207,61 +177,42 @@ async function streamAgent(session: AgentSession, task: string, history: ChatMes
 }
 
 // ---------------------------------------------------------------------------
-// Plan helpers
+// Glue: parse plan JSON from agent output
 // ---------------------------------------------------------------------------
-interface PendingPlan {
-  name: string;
-  cards: { title: string; slug: string; wave: number; ac: string[] }[];
-}
-
-let PENDING_PLAN: PendingPlan | null = null;
-
-function parseIssueNumbers(message: string): number[] {
-  const match = message.match(/--issues\s+([\d,\s]+)/);
-  if (!match) return [];
-  return match[1]
-    .split(",")
-    .map((s) => parseInt(s.trim(), 10))
-    .filter((n) => !isNaN(n));
-}
-
-function fetchIssueDetails(issueNumbers: number[]): { number: number; title: string; body: string; labels: string[] }[] {
-  const issues: { number: number; title: string; body: string; labels: string[] }[] = [];
-  for (const num of issueNumbers) {
-    const result = Bun.spawnSync(["gh", "issue", "view", String(num), "--json", "number,title,body,labels"]);
-    if (result.exitCode === 0) {
-      try {
-        const data = JSON.parse(result.stdout.toString().trim());
-        issues.push({
-          number: data.number,
-          title: data.title,
-          body: data.body ?? "",
-          labels: (data.labels ?? []).map((l: any) => l.name),
-        });
-      } catch {}
-    }
-  }
-  return issues;
-}
-
 function parsePlannerOutput(history: ChatMessage[]): PendingPlan | null {
   for (let i = history.length - 1; i >= 0; i--) {
     const entry = history[i];
-    if (entry.role === "assistant" && entry.content.includes("planner")) {
-      const jsonMatch = entry.content.match(/```json\s*\n([\s\S]*?)\n```/);
-      if (jsonMatch) {
-        try {
-          const data = JSON.parse(jsonMatch[1]);
-          if (data.name && Array.isArray(data.cards)) return data as PendingPlan;
-        } catch {
-          continue;
-        }
-      }
+    if (entry.role !== "assistant") continue;
+    const jsonMatch = entry.content.match(/```json\s*\n([\s\S]*?)\n```/);
+    if (jsonMatch) {
+      try {
+        const data = JSON.parse(jsonMatch[1]);
+        if (data.name && Array.isArray(data.cards)) return data as PendingPlan;
+      } catch { continue; }
     }
   }
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Glue: collect PR comments (programmatic, no agent)
+// ---------------------------------------------------------------------------
+function collectPrComments(prNumber: number): string {
+  const { stdout } = Bun.spawnSync(["gh", "pr", "view", String(prNumber), "--json", "comments"]);
+  return stdout.toString();
+}
+
+// ---------------------------------------------------------------------------
+// Glue: health check (programmatic, no agent)
+// ---------------------------------------------------------------------------
+function checkAppHealth(): boolean {
+  const r = Bun.spawnSync(["curl", "-sf", "http://localhost:8080/healthz"]);
+  return r.exitCode === 0;
+}
+
+// ---------------------------------------------------------------------------
+// Glue: compute next git tag
+// ---------------------------------------------------------------------------
 function computeNextTag(): { latest: string; next: string } {
   const result = Bun.spawnSync(["git", "tag", "--sort=-v:refname"]);
   const tags = result.stdout.toString().trim().split("\n").filter(Boolean);
@@ -272,123 +223,126 @@ function computeNextTag(): { latest: string; next: string } {
 }
 
 // ---------------------------------------------------------------------------
-// Verify + Route loop (re-entrant, bounded by reviewRound)
+// ReAct Loop: one card through execute → review → PM decide → fix
 // ---------------------------------------------------------------------------
-async function verifyAndRoute(card: CardState, history: ChatMessage[]): Promise<ChatMessage[]> {
-  let executorSummary = "";
-  for (let i = history.length - 1; i >= 0; i--) {
-    const entry = history[i];
-    if (entry.role === "assistant" && entry.content.includes(`executor-${card.slug}`)) {
-      executorSummary = entry.content.slice(0, 500);
-      break;
-    }
-  }
+async function reactLoop(card: CardState, history: ChatMessage[]): Promise<ChatMessage[]> {
+  // Phase 1: Executor
+  card.status = "executing";
+  const worktreePath = GH.createWorktree(cardBranch(card));
+  log("worktree", "pipeline", `created ${worktreePath}`);
 
-  const verifierPrompt = buildVerifierPrompt(card.acceptanceCriteria, "", executorSummary);
-  let vResult: { approved: boolean; acResults: any[]; issues: string[] };
+  const executor = getOrCreateSession(`executor-${card.slug}`, "Executor");
+  history.push({ role: "assistant", content: `\u26A1 **executor-${card.slug}** implementing Card ${card.id}: ${card.title}...` });
+  pushFullState(history);
   try {
-    const vRaw = await callOneshot("Verifier", verifierPrompt);
-    vResult = parseVerifierResponse(vRaw);
+    history = await streamAgent(executor, `Implement Card ${card.id}: ${card.title}. ACs: ${card.acceptanceCriteria.join(", ")}. Branch: ${cardBranch(card)}. Worktree: ${worktreePath}`, history);
   } catch (e: any) {
-    vResult = { approved: false, acResults: [], issues: [`Verifier error: ${e.message}`] };
-    history.push({ role: "assistant", content: `\u274C **Verifier error for Card ${card.id}:** ${e.message}` });
+    history.push({ role: "assistant", content: `\u274C Executor error: ${e.message}` });
+  }
+  EVENT_LOG.append("executor", "done", { card: card.id });
+
+  // Glue: create PR
+  const prUrl = GH.createPr(cardBranch(card), `Card ${card.id}: ${card.title}`, card.acceptanceCriteria.join("\n- "));
+  const prMatch = prUrl.match(/\/(\d+)$/);
+  card.prNumber = prMatch ? parseInt(prMatch[1], 10) : null;
+  if (card.prNumber) {
+    history.push({ role: "assistant", content: `\uD83D\uDD17 PR #${card.prNumber} created` });
     pushFullState(history);
   }
 
-  const routerPrompt = buildRouterPrompt(
-    card.title,
-    vResult.approved ? "approve" : "request_changes",
-    card.reviewRound + 1,
-    JSON.stringify(vResult),
-  );
-  let rResult: { decision: string; reason: string };
-  try {
-    const rRaw = await callOneshot("Router", routerPrompt);
-    rResult = parseRouterResponse(rRaw);
-  } catch (e: any) {
-    rResult = { decision: "escalate_to_human", reason: `Router error: ${e.message}` };
-    history.push({ role: "assistant", content: `\u274C **Router error for Card ${card.id}:** ${e.message}` });
-    pushFullState(history);
+  // Phase 2a: Codex Reviewer (parallel) + wait bot comments
+  card.status = "reviewing";
+  history.push({ role: "assistant", content: `\uD83D\uDD0D Reviewing Card ${card.id}... (Codex + bots + Reviewer)` });
+  pushFullState(history);
+
+  // Start Codex review (fire-and-forget, posts to PR)
+  if (card.prNumber) {
+    Bun.spawn(["codex", "review", "--model", "gpt-5.4", "--pr", String(card.prNumber)]);
+    log("codex_review", "pipeline", `PR #${card.prNumber}`);
   }
 
-  const vIcon = vResult.approved ? "\u2713" : "\u2717";
+  // Wait for bot comments (poll up to 5 min)
+  const deadline = Date.now() + 5 * 60 * 1000;
+  while (Date.now() < deadline && card.prNumber) {
+    const comments = collectPrComments(card.prNumber);
+    if (comments.includes("codecov") || comments.includes("coderabbit")) break;
+    await new Promise((r) => setTimeout(r, 15000));
+  }
+
+  // Phase 2b: Reviewer (Claude)
+  const reviewer = getOrCreateSession(`reviewer-${card.slug}`, "Reviewer");
+  try {
+    history = await streamAgent(
+      reviewer,
+      card.prNumber
+        ? `Review PR #${card.prNumber}. ACs: ${card.acceptanceCriteria.join(", ")}. Run gh pr diff ${card.prNumber} to read the diff. Read all bot comments with gh pr view ${card.prNumber} --json comments. Synthesize findings from your review + Codex + all bots. Post your findings as a PR comment.`
+        : `Review Card ${card.id}: ${card.title}. ACs: ${card.acceptanceCriteria.join(", ")}.`,
+      history,
+    );
+  } catch (e: any) {
+    history.push({ role: "assistant", content: `\u274C Reviewer error: ${e.message}` });
+  }
+  EVENT_LOG.append("reviewer", "review", { card: card.id });
+
+  // Phase 3: PM quality gate
+  if (!card.prNumber) {
+    card.status = "blocked";
+    history.push({ role: "assistant", content: `\u274C Card ${card.id}: no PR created. Blocked.` });
+    pushFullState(history);
+    return history;
+  }
+
+  const rawComments = collectPrComments(card.prNumber);
+  const pmResult = await callOneshot("PM", `You are the PR quality gate. Read these raw PR comments and decide pass or fail.\n\nPR #${card.prNumber} comments:\n${rawComments}`);
+
+  let pmDecision: { decision: string; reason: string } = { decision: "fail", reason: "could not parse PM response" };
+  try {
+    const match = pmResult.match(/```json\s*\n([\s\S]*?)\n```/) || [null, pmResult];
+    pmDecision = JSON.parse(match[1] ?? pmResult);
+  } catch {}
+
+  const pmIcon = pmDecision.decision === "pass" ? "\u2713" : "\u2717";
   history.push({
     role: "assistant",
-    content:
-      `---\n${vIcon} **Verifier** Card ${card.id}: ${vResult.approved ? "approved" : "issues found"}\n` +
-      `\uD83D\uDD00 **Router** Card ${card.id}: \`${rResult.decision}\` \u2014 ${rResult.reason}\n---`,
+    content: `${pmIcon} **PM** Card ${card.id}: \`${pmDecision.decision}\` \u2014 ${pmDecision.reason}`,
   });
+  EVENT_LOG.append("pm", "gate", { card: card.id, decision: pmDecision.decision });
 
-  EVENT_LOG.append("verifier", "check", { card: card.id, approved: vResult.approved });
-  EVENT_LOG.append("router", "decide", { card: card.id, decision: rResult.decision });
+  if (pmDecision.decision === "pass") {
+    // Glue: rebase + merge + cleanup
+    GH.rebaseBranch(cardBranch(card));
+    GH.mergePr(card.prNumber);
+    GH.removeWorktree(cardBranch(card));
+    card.status = "merged";
+    log("merge", "pipeline", `card ${card.id} PR #${card.prNumber}`);
+  } else if (card.reviewRound < 3) {
+    // Fail: send raw comments to Executor, loop
+    card.reviewRound++;
+    history.push({
+      role: "assistant",
+      content: `\u{1F504} Re-executing Card ${card.id} (round ${card.reviewRound}/3)...`,
+    });
+    pushFullState(history);
 
-  switch (rResult.decision) {
-    case "merge":
-      card.status = "merged";
-      break;
-    case "skip":
-      card.status = "skipped";
-      break;
-    case "escalate_to_human":
-      card.status = "blocked";
-      history.push({
-        role: "assistant",
-        content: `**Card ${card.id} escalated.** ${rResult.reason}\n\n\`resolve ${card.id}\` to unblock, \`skip ${card.id}\` to skip.`,
-      });
-      break;
-    case "re_execute":
-    case "re_execute_with_findings": {
-      card.reviewRound++;
-      if (card.reviewRound >= 3) {
-        card.status = "blocked";
-        history.push({
-          role: "assistant",
-          content: `**Card ${card.id} blocked** after ${card.reviewRound} attempts. Escalating.\n\n\`resolve ${card.id}\` or \`skip ${card.id}\``,
-        });
-      } else {
-        card.status = "executing";
-        history.push({
-          role: "assistant",
-          content: `\u{1F504} **Re-executing Card ${card.id}** (attempt ${card.reviewRound + 1}). Reason: ${rResult.reason}`,
-        });
-        pushFullState(history);
-        const reExec = getOrCreateSession(`executor-${card.slug}`, "Executor");
-        try {
-          history = await streamAgent(
-            reExec,
-            `Re-implement Card ${card.id}: ${card.title}. Previous issues: ${rResult.reason}. ` +
-              `ACs: ${card.acceptanceCriteria.join(", ")}. Branch: ${cardBranch(card)}`,
-            history,
-          );
-        } catch (e: any) {
-          history.push({ role: "assistant", content: `\u274C Re-executor error: ${e.message}` });
-        }
-        // Recurse through verify+route again
-        history = await verifyAndRoute(card, history);
-      }
-      break;
-    }
-    case "proceed_to_review": {
-      card.status = "reviewing";
-      const reReviewer = getOrCreateSession(`reviewer-${card.slug}`, "Reviewer");
+    const reExecutor = getOrCreateSession(`executor-${card.slug}`, "Executor");
+    try {
       history = await streamAgent(
-        reReviewer,
-        `Re-review Card ${card.id}: ${card.title}. ACs: ${card.acceptanceCriteria.join(", ")}.`,
+        reExecutor,
+        `Card ${card.id} PR #${card.prNumber} needs fixes. Read the PR comments with: gh pr view ${card.prNumber} --json comments\nFix all issues and push to the same branch.`,
         history,
       );
-      history = await verifyAndRoute(card, history);
-      break;
+    } catch (e: any) {
+      history.push({ role: "assistant", content: `\u274C Re-executor error: ${e.message}` });
     }
-    case "proceed_to_test":
-      card.status = "merged"; // test phase picks up "merged" cards
-      break;
-    default:
-      card.status = "blocked";
-      history.push({
-        role: "assistant",
-        content: `**Card ${card.id}: unknown decision** \`${rResult.decision}\`. Escalating.\n\n\`resolve ${card.id}\` or \`skip ${card.id}\``,
-      });
-      break;
+
+    // Recurse through review cycle
+    history = await reactLoop(card, history);
+  } else {
+    card.status = "blocked";
+    history.push({
+      role: "assistant",
+      content: `\u274C Card ${card.id} blocked after 3 rounds. \`resolve ${card.id}\` or \`skip ${card.id}\``,
+    });
   }
 
   pushFullState(history);
@@ -396,7 +350,7 @@ async function verifyAndRoute(card: CardState, history: ChatMessage[]): Promise<
 }
 
 // ---------------------------------------------------------------------------
-// Orchestrator logic
+// Orchestrator: state-driven message handling
 // ---------------------------------------------------------------------------
 async function orchestratorChat(message: string, history: ChatMessage[]): Promise<ChatMessage[]> {
   if (!message.trim()) {
@@ -407,287 +361,23 @@ async function orchestratorChat(message: string, history: ChatMessage[]): Promis
   history = [...history, { role: "user", content: message }];
   const msg = message.trim().toLowerCase();
 
-  // /plan command — fetch issues, run Planner, parse output
-  if (msg.includes("/plan")) {
-    const issueNums = parseIssueNumbers(message);
-    log("plan_start", "orchestrator", issueNums.length > 0 ? `issues: ${issueNums.join(",")}` : "explore");
-    history.push({ role: "assistant", content: "\uD83D\uDCCB Opening **Planner** session..." });
-    pushFullState(history);
-
-    let plannerPrompt: string;
-    if (issueNums.length > 0) {
-      const issues = fetchIssueDetails(issueNums);
-      if (issues.length === 0) {
-        history.push({ role: "assistant", content: `\u274C Could not fetch any issues. Check \`gh auth status\` and issue numbers.` });
-        orchestratorHistory = history;
-        pushFullState(history);
-        return history;
-      }
-      const issueContext = issues
-        .map((i) => `### Issue #${i.number}: ${i.title}\n${i.body}\nLabels: ${i.labels.join(", ") || "none"}`)
-        .join("\n\n");
-      plannerPrompt =
-        `You have the following GitHub issues to plan:\n\n${issueContext}\n\n` +
-        `Explore the codebase to understand the current architecture, then produce a sprint spec.\n\n` +
-        `Include a Task Breakdown where each task has a title, slug, wave number, and acceptance criteria.\n` +
-        `Tasks that can run in parallel share a wave. Dependent tasks go in later waves.\n\n` +
-        `IMPORTANT: At the end, output a JSON block fenced with \`\`\`json containing:\n` +
-        `{"name": "iter-name", "cards": [{"title": "...", "slug": "...", "wave": 1, "ac": ["criterion 1", "criterion 2"]}]}`;
-    } else {
-      plannerPrompt =
-        `Explore the codebase and propose work for the next iteration.\n\n` +
-        `Produce a sprint spec with a Task Breakdown. Each task needs a title, slug, wave number, and acceptance criteria.\n\n` +
-        `IMPORTANT: At the end, output a JSON block fenced with \`\`\`json containing:\n` +
-        `{"name": "iter-name", "cards": [{"title": "...", "slug": "...", "wave": 1, "ac": ["criterion 1", "criterion 2"]}]}`;
-    }
-
-    const planner = getOrCreateSession("planner", "Planner");
-    try {
-      history = await streamAgent(planner, plannerPrompt, history);
-    } catch (e: any) {
-      history.push({ role: "assistant", content: `\u274C Planner error: ${e.message}` });
-    }
-
-    const parsed = parsePlannerOutput(history);
-    if (parsed) {
-      PENDING_PLAN = parsed;
-      const cardTable = parsed.cards
-        .map((c, i) => `| ${i + 1} | ${c.title} | ${c.wave} | \`card-${i + 1}-${c.slug}\` |`)
-        .join("\n");
-      history.push({
-        role: "assistant",
-        content:
-          `---\n\n**Sprint: ${parsed.name}** (${parsed.cards.length} cards)\n\n` +
-          `| # | Title | Wave | Branch |\n|---|-------|------|--------|\n${cardTable}\n\n` +
-          `---\n\n**Approve?** \`approve\` / \`revise: <feedback>\``,
-      });
-    } else {
-      history.push({
-        role: "assistant",
-        content: `---\n\n\u26A0\uFE0F Could not parse structured plan from Planner output.\nReview the spec above and try \`/plan\` again, or manually create a plan.`,
-      });
-    }
+  // --- Global commands (any state) ---
+  if (msg === "status") {
+    const active = [...SESSIONS.entries()]
+      .filter(([, s]) => s.client)
+      .map(([n, s]) => `- **${n}**: ${s.status} (last: ${s.lastTool})`);
+    history.push({ role: "assistant", content: `**Phase:** ${currentPhase}\n**Active agents:**\n${active.length > 0 ? active.join("\n") : "None"}` });
     orchestratorHistory = history;
     pushFullState(history);
     return history;
   }
 
-  // revise: <feedback> — re-invoke Planner
-  if (msg.startsWith("revise:") || msg.startsWith("revise ")) {
-    const feedback = message.trim().slice(message.indexOf(":") + 1 || message.indexOf(" ") + 1).trim();
-    const planner = getOrCreateSession("planner", "Planner");
-    try {
-      history = await streamAgent(planner, `Revise the plan based on this feedback: ${feedback}`, history);
-    } catch (e: any) {
-      history.push({ role: "assistant", content: `\u274C Planner error: ${e.message}` });
-    }
-    const parsed = parsePlannerOutput(history);
-    if (parsed) PENDING_PLAN = parsed;
-    history.push({ role: "assistant", content: `---\n\n**Approve?** \`approve\` / \`revise: <feedback>\`` });
-    orchestratorHistory = history;
-    pushFullState(history);
-    return history;
-  }
-
-  // approve — create sprint from PENDING_PLAN
-  if (msg === "approve") {
-    if (!PENDING_PLAN) {
-      history.push({ role: "assistant", content: "\u26A0\uFE0F No plan to approve. Run \`/plan\` first." });
-      orchestratorHistory = history;
-      pushFullState(history);
-      return history;
-    }
-
-    EVENT_LOG.append("orchestrator", "sprint_start");
-    log("sprint_start", "orchestrator", `approve \u2192 ${PENDING_PLAN.name}`);
-
-    SPRINT_PLAN = {
-      name: PENDING_PLAN.name,
-      cards: PENDING_PLAN.cards.map((c, i) => createCard(i + 1, c.title, c.slug, c.wave, c.ac)),
-    };
-    PENDING_PLAN = null;
-
-    for (const waveNum of allWaves(SPRINT_PLAN)) {
-      const waveCards = getWave(SPRINT_PLAN, waveNum);
-      log("wave_start", "orchestrator", `wave ${waveNum}`);
-      EVENT_LOG.append("orchestrator", "wave_start", { wave: waveNum });
-
-      const cardNames = waveCards.map((c) => `Card ${c.id}: ${c.title}`).join(", ");
-      history.push({
-        role: "assistant",
-        content: `\u26A1 **Wave ${waveNum}** \u2014 ${waveCards.length} cards:\n${cardNames}`,
-      });
-      pushFullState(history);
-
-      // Phase 1: Execute
-      for (const card of waveCards) {
-        card.status = "executing";
-        const executorName = `executor-${card.slug}`;
-        history.push({
-          role: "assistant",
-          content: `\u26A1 **${executorName}** starting Card ${card.id}: ${card.title}...`,
-        });
-        pushFullState(history);
-
-        const executor = getOrCreateSession(executorName, "Executor");
-        try {
-          history = await streamAgent(
-            executor,
-            `Implement Card ${card.id}: ${card.title}. ` +
-              `ACs: ${card.acceptanceCriteria.join(", ")}. ` +
-              `Branch: ${cardBranch(card)}`,
-            history,
-          );
-        } catch (e: any) {
-          history.push({ role: "assistant", content: `\u274C Executor error: ${e.message}` });
-        }
-        EVENT_LOG.append("executor", "done", { card: card.id });
-        log("done", executorName, `card ${card.id}`);
-      }
-
-      // Phase 2: Review
-      for (const card of waveCards) {
-        card.status = "reviewing";
-        const reviewerName = `reviewer-${card.slug}`;
-        history.push({ role: "assistant", content: `\uD83D\uDD0D **${reviewerName}** reviewing Card ${card.id}...` });
-        pushFullState(history);
-
-        const reviewer = getOrCreateSession(reviewerName, "Reviewer");
-        try {
-          history = await streamAgent(
-            reviewer,
-            `Review Card ${card.id}: ${card.title}. ACs: ${card.acceptanceCriteria.join(", ")}.`,
-            history,
-          );
-        } catch (e: any) {
-          history.push({ role: "assistant", content: `\u274C Reviewer error: ${e.message}` });
-        }
-        EVENT_LOG.append("reviewer", "review", { card: card.id });
-        log("review", reviewerName, `card ${card.id}`);
-      }
-
-      // Phase 3: Verify + Route (with re-execution support)
-      for (const card of waveCards) {
-        history = await verifyAndRoute(card, history);
-      }
-
-      // Phase 4: Test merged cards
-      const merged = waveCards.filter((c) => c.status === "merged");
-      if (merged.length > 0) {
-        history.push({
-          role: "assistant",
-          content:
-            `\uD83D\uDE80 **Orchestrator** starting app for Wave ${waveNum} testing...\n` +
-            "`make serve` (backend :8080 + frontend :3000)",
-        });
-        pushFullState(history);
-
-        history.push({
-          role: "assistant",
-          content:
-            `\uD83E\uDDEA **Tester** \u2014 testing running app after Wave ${waveNum} merge.\n` +
-            `Testing ${merged.length} merged cards on main...`,
-        });
-        pushFullState(history);
-
-        const tester = getOrCreateSession(`tester-wave${waveNum}`, "Tester");
-        const acAll = merged.flatMap((c) => c.acceptanceCriteria.map((ac) => `Card ${c.id} (${c.title}): ${ac}`));
-
-        try {
-          history = await streamAgent(
-            tester,
-            `Test the running app. Verify these ACs from Wave ${waveNum}:\n` + acAll.map((ac) => `- ${ac}`).join("\n"),
-            history,
-          );
-        } catch (e: any) {
-          history.push({ role: "assistant", content: `\u274C Tester error: ${e.message}` });
-        }
-
-        EVENT_LOG.append("tester", "test", { wave: waveNum });
-        log("test", `tester-wave${waveNum}`, `wave ${waveNum}`);
-
-        history.push({
-          role: "assistant",
-          content: `\u2705 **Wave ${waveNum} complete.** ${merged.length} cards merged and tested.`,
-        });
-        pushFullState(history);
-      }
-    }
-
-    // Sprint complete
-    history.push({
-      role: "assistant",
-      content:
-        "## \uD83C\uDF89 Sprint Complete\n\n" +
-        renderSprintBoard(SPRINT_PLAN) +
-        "\n\n*All waves executed, reviewed, merged, and tested.*\n\n---\n\n" +
-        "**Deploy?** Orchestrator will tag and push to trigger CI deploy.\n\n" +
-        "`deploy` \u2014 preview tag + confirm\n" +
-        "`skip-deploy` \u2014 done, don't deploy yet",
-    });
-    EVENT_LOG.append("orchestrator", "sprint_complete");
-    orchestratorHistory = history;
-    pushFullState(history);
-    return history;
-  }
-
-  // deploy — preview what will happen
-  if (msg === "deploy" && SPRINT_PLAN) {
-    const { latest, next } = computeNextTag();
-    history.push({
-      role: "assistant",
-      content:
-        `\uD83D\uDE80 **Deploy preview:**\n` +
-        `- Latest tag: \`${latest}\`\n` +
-        `- Next tag: \`${next}\`\n` +
-        `- Will run: \`git tag ${next} && git push origin ${next}\`\n\n` +
-        `**Confirm?** \`confirm-deploy\` / \`skip-deploy\``,
-    });
-    orchestratorHistory = history;
-    pushFullState(history);
-    return history;
-  }
-
-  // confirm-deploy — actually tag and push
-  if (msg === "confirm-deploy" && SPRINT_PLAN) {
-    const { next } = computeNextTag();
-    const tagResult = Bun.spawnSync(["git", "tag", next]);
-    if (tagResult.exitCode !== 0) {
-      history.push({ role: "assistant", content: `\u274C Could not create tag \`${next}\`: ${tagResult.stderr.toString().trim()}` });
-      orchestratorHistory = history;
-      pushFullState(history);
-      return history;
-    }
-    const pushResult = Bun.spawnSync(["git", "push", "origin", next]);
-    if (pushResult.exitCode !== 0) {
-      history.push({ role: "assistant", content: `\u274C Could not push tag \`${next}\`: ${pushResult.stderr.toString().trim()}` });
-      orchestratorHistory = history;
-      pushFullState(history);
-      return history;
-    }
-    history.push({ role: "assistant", content: `\u2705 **Deployed \`${next}\`.** CI triggered. Sprint done.` });
-    EVENT_LOG.append("orchestrator", "deploy", { tag: next });
-    log("deploy", "orchestrator", `tagged ${next}`);
-    orchestratorHistory = history;
-    pushFullState(history);
-    return history;
-  }
-
-  // skip-deploy
-  if (msg === "skip-deploy" && SPRINT_PLAN) {
-    history.push({ role: "assistant", content: "\u23ED\uFE0F Deploy skipped. Sprint complete without deploy." });
-    orchestratorHistory = history;
-    pushFullState(history);
-    return history;
-  }
-
-  // resolve <cardId> — unblock escalated card
   if (msg.startsWith("resolve ") && SPRINT_PLAN) {
     const cardId = parseInt(msg.split(" ")[1], 10);
     const card = SPRINT_PLAN.cards.find((c) => c.id === cardId);
     if (card && card.status === "blocked") {
       card.status = "merged";
-      history.push({ role: "assistant", content: `\u2705 Card ${cardId} resolved \u2192 merged.` });
+      history.push({ role: "assistant", content: `\u2705 Card ${cardId} resolved.` });
     } else {
       history.push({ role: "assistant", content: `\u26A0\uFE0F Card ${cardId} not found or not blocked.` });
     }
@@ -696,65 +386,278 @@ async function orchestratorChat(message: string, history: ChatMessage[]): Promis
     return history;
   }
 
-  // skip <cardId> — skip blocked card
   if (msg.startsWith("skip ") && SPRINT_PLAN) {
     const cardId = parseInt(msg.split(" ")[1], 10);
     const card = SPRINT_PLAN.cards.find((c) => c.id === cardId);
     if (card) {
       card.status = "skipped";
       history.push({ role: "assistant", content: `\u23ED\uFE0F Card ${cardId} skipped.` });
-    } else {
-      history.push({ role: "assistant", content: `\u26A0\uFE0F Card ${cardId} not found.` });
     }
     orchestratorHistory = history;
     pushFullState(history);
     return history;
   }
 
-  // chat with <agent>
-  if (msg.startsWith("chat with")) {
-    const agentName = message.trim().slice("chat with".length).trim().toLowerCase();
-    const agentMap = Object.fromEntries(Object.keys(AGENT_CONFIGS).map((k) => [k.toLowerCase(), k]));
-    if (agentMap[agentName]) {
-      history.push({
-        role: "assistant",
-        content: `\uD83D\uDD04 Switching to **${agentMap[agentName]}** direct chat.\n\n*Use the dropdown above to switch back to Orchestrator.*`,
-      });
-    } else {
-      history.push({
-        role: "assistant",
-        content: `\u2753 Unknown agent '${agentName}'. Available: ${Object.keys(AGENT_CONFIGS).join(", ")}`,
-      });
+  // --- State-specific handling ---
+  switch (currentPhase) {
+    case Phase.IDLE: {
+      // Any message in IDLE = start planning
+      currentPhase = Phase.ELABORATING;
+      log("plan_start", "pipeline", message.slice(0, 80));
+      history.push({ role: "assistant", content: "\uD83D\uDCCB Starting planning..." });
+      pushFullState(history);
+
+      // Start Planner
+      const planner = getOrCreateSession("planner", "Planner");
+      try {
+        history = await streamAgent(
+          planner,
+          `The user wants: "${message}"\n\nExplore the codebase, clarify requirements, and produce a spec with task breakdown and ACs. At the end, output a JSON block with: {"name": "iter-name", "cards": [{"title": "...", "slug": "...", "wave": 1, "dependsOn": [], "ac": ["..."]}]}`,
+          history,
+        );
+      } catch (e: any) {
+        history.push({ role: "assistant", content: `\u274C Planner error: ${e.message}` });
+      }
+
+      // Parse spec and run PM to arrange iteration
+      const parsed = parsePlannerOutput(history);
+      if (parsed) {
+        PENDING_PLAN = parsed;
+        currentPhase = Phase.AWAITING_APPROVAL;
+
+        const cardTable = parsed.cards
+          .map((c, i) => `| ${i + 1} | ${c.title} | ${c.wave} | \`card-${i + 1}-${c.slug}\` |`)
+          .join("\n");
+        history.push({
+          role: "assistant",
+          content:
+            `---\n\n**Sprint: ${parsed.name}** (${parsed.cards.length} cards)\n\n` +
+            `| # | Title | Wave | Branch |\n|---|-------|------|--------|\n${cardTable}\n\n` +
+            `---\n\n**Approve?** \`approve\` / or give feedback to revise`,
+        });
+      } else {
+        currentPhase = Phase.IDLE;
+        history.push({
+          role: "assistant",
+          content: `\u26A0\uFE0F Could not parse plan from Planner output. Describe what you need and I'll try again.`,
+        });
+      }
+      break;
     }
-    orchestratorHistory = history;
-    pushFullState(history);
-    return history;
+
+    case Phase.ELABORATING: {
+      // Forward message to Planner as follow-up
+      const planner = getOrCreateSession("planner", "Planner");
+      try {
+        history = await streamAgent(planner, message, history);
+      } catch (e: any) {
+        history.push({ role: "assistant", content: `\u274C Planner error: ${e.message}` });
+      }
+
+      const parsed = parsePlannerOutput(history);
+      if (parsed) {
+        PENDING_PLAN = parsed;
+        currentPhase = Phase.AWAITING_APPROVAL;
+        history.push({ role: "assistant", content: `---\n\n**Approve?** \`approve\` / or give feedback` });
+      }
+      break;
+    }
+
+    case Phase.AWAITING_APPROVAL: {
+      const positive = ["approve", "approved", "lgtm", "ok", "yes", "confirm",
+        "\u597D\u7684", "\u53EF\u4EE5", "\u786E\u8BA4", "\u5F00\u59CB\u5427", "\u6CA1\u95EE\u9898"].includes(msg);
+
+      if (positive && PENDING_PLAN) {
+        // Create sprint from plan
+        currentPhase = Phase.EXECUTING;
+        EVENT_LOG.append("orchestrator", "sprint_start");
+        log("sprint_start", "pipeline", PENDING_PLAN.name);
+
+        SPRINT_PLAN = {
+          name: PENDING_PLAN.name,
+          cards: PENDING_PLAN.cards.map((c, i) => createCard(i + 1, c.title, c.slug, c.wave, c.ac, c.dependsOn ?? [])),
+        };
+        PENDING_PLAN = null;
+
+        // Execute waves
+        for (const waveNum of allWaves(SPRINT_PLAN)) {
+          const waveCards = getWave(SPRINT_PLAN, waveNum);
+          log("wave_start", "pipeline", `wave ${waveNum}`);
+          EVENT_LOG.append("orchestrator", "wave_start", { wave: waveNum });
+
+          const cardNames = waveCards.map((c) => `Card ${c.id}: ${c.title}`).join(", ");
+          history.push({ role: "assistant", content: `\u26A1 **Wave ${waveNum}** \u2014 ${waveCards.length} cards: ${cardNames}` });
+          pushFullState(history);
+
+          // ReAct Loop per card (parallel execute, sequential merge)
+          // Cards in the same wave execute in parallel, but merge sequentially
+          const cardPromises = waveCards.map((card) => reactLoop(card, [...history]));
+          const cardHistories = await Promise.all(cardPromises);
+          // Merge all card histories into main history
+          for (const cardHistory of cardHistories) {
+            const newEntries = cardHistory.filter((h) => !history.includes(h));
+            history.push(...newEntries);
+          }
+          pushFullState(history);
+
+          // After wave merge: Tester
+          const merged = waveCards.filter((c) => c.status === "merged");
+          if (merged.length > 0) {
+            // Glue: start app + health check
+            history.push({ role: "assistant", content: `\uD83D\uDE80 Starting app for Wave ${waveNum} testing...` });
+            pushFullState(history);
+            Bun.spawnSync(["make", "serve"]);
+            await new Promise((r) => setTimeout(r, 5000));
+
+            const healthy = checkAppHealth();
+            if (!healthy) {
+              history.push({ role: "assistant", content: `\u26A0\uFE0F App health check failed. Skipping Tester for Wave ${waveNum}.` });
+              pushFullState(history);
+            } else {
+              // Start Tester
+              const tester = getOrCreateSession(`tester-wave${waveNum}`, "Tester");
+              const acAll = merged.flatMap((c) => c.acceptanceCriteria.map((ac) => `Card ${c.id} (${c.title}): ${ac}`));
+              try {
+                history = await streamAgent(
+                  tester,
+                  `Test the running app. Verify these ACs from Wave ${waveNum}:\n${acAll.map((ac) => `- ${ac}`).join("\n")}\n\nFor each passing AC, write or augment automated tests.`,
+                  history,
+                );
+              } catch (e: any) {
+                history.push({ role: "assistant", content: `\u274C Tester error: ${e.message}` });
+              }
+
+              // PM reviews Tester findings
+              const testerOutput = history.filter((h) => h.content.includes(`tester-wave${waveNum}`)).pop()?.content ?? "";
+              const pmTesterResult = await callOneshot("PM", `Review these Tester findings and decide pass or fail:\n\n${testerOutput}`);
+              history.push({ role: "assistant", content: `\uD83D\uDCCA PM reviewed Tester findings: ${pmTesterResult.slice(0, 200)}` });
+
+              EVENT_LOG.append("tester", "test", { wave: waveNum });
+              log("test", `tester-wave${waveNum}`, `wave ${waveNum}`);
+            }
+
+            history.push({
+              role: "assistant",
+              content: `\u2705 **Wave ${waveNum} complete.** ${merged.length} cards merged.`,
+            });
+            pushFullState(history);
+          }
+        }
+
+        // Sprint complete
+        currentPhase = Phase.AWAITING_DEPLOY;
+        history.push({
+          role: "assistant",
+          content:
+            "## \uD83C\uDF89 Sprint Complete\n\n" +
+            renderSprintBoard(SPRINT_PLAN) +
+            "\n\n*All waves executed, reviewed, and tested.*\n\n" +
+            "`deploy` \u2014 bump version + tag + push\n" +
+            "`skip-deploy` \u2014 done without deploy",
+        });
+        EVENT_LOG.append("orchestrator", "sprint_complete");
+      } else if (msg === "cancel") {
+        PENDING_PLAN = null;
+        currentPhase = Phase.IDLE;
+        history.push({ role: "assistant", content: "Cancelled. Describe new work when ready." });
+      } else {
+        // Treat as revision feedback → back to Planner
+        currentPhase = Phase.ELABORATING;
+        const planner = getOrCreateSession("planner", "Planner");
+        try {
+          history = await streamAgent(planner, `Revise the plan based on this feedback: ${message}`, history);
+        } catch (e: any) {
+          history.push({ role: "assistant", content: `\u274C Planner error: ${e.message}` });
+        }
+        const parsed = parsePlannerOutput(history);
+        if (parsed) {
+          PENDING_PLAN = parsed;
+          currentPhase = Phase.AWAITING_APPROVAL;
+        }
+        history.push({ role: "assistant", content: `---\n\n**Approve?** \`approve\` / or give more feedback` });
+      }
+      break;
+    }
+
+    case Phase.EXECUTING: {
+      // During execution, user can only resolve/skip blocked cards
+      history.push({
+        role: "assistant",
+        content: `Sprint is running. Available: \`resolve <id>\` / \`skip <id>\` / \`status\``,
+      });
+      break;
+    }
+
+    case Phase.AWAITING_DEPLOY: {
+      if (msg === "deploy" || msg === "\u90E8\u7F72" || msg === "\u53D1\u5E03") {
+        const { latest, next } = computeNextTag();
+        history.push({
+          role: "assistant",
+          content: `\uD83D\uDE80 **Deploy preview:** \`${latest}\` \u2192 \`${next}\`\n\n\`confirm-deploy\` / \`skip-deploy\``,
+        });
+        currentPhase = Phase.DEPLOY_VERIFY;
+      } else if (msg === "skip-deploy") {
+        currentPhase = Phase.COMPLETE;
+        history.push({ role: "assistant", content: "\u23ED\uFE0F Deploy skipped. Sprint complete." });
+      }
+      break;
+    }
+
+    case Phase.DEPLOY_VERIFY: {
+      if (msg === "confirm-deploy" || msg === "confirm" || msg === "\u786E\u8BA4") {
+        const { next } = computeNextTag();
+        // Glue: bump version in package files
+        const bumpResult = Bun.spawnSync(["node", "-e", `
+          const fs = require('fs');
+          for (const f of ['plugins/reins/package.json', 'plugins/reins/.claude-plugin/plugin.json']) {
+            try { const j = JSON.parse(fs.readFileSync(f)); j.version = '${next.replace("v", "")}'; fs.writeFileSync(f, JSON.stringify(j, null, 2) + '\\n'); } catch {}
+          }
+        `]);
+
+        const tagResult = Bun.spawnSync(["git", "tag", next]);
+        if (tagResult.exitCode !== 0) {
+          history.push({ role: "assistant", content: `\u274C Tag failed: ${tagResult.stderr.toString().trim()}` });
+          break;
+        }
+        const pushResult = Bun.spawnSync(["git", "push", "origin", next]);
+        if (pushResult.exitCode !== 0) {
+          history.push({ role: "assistant", content: `\u274C Push failed: ${pushResult.stderr.toString().trim()}` });
+          break;
+        }
+
+        // Deploy verification: wait for CI + health check
+        history.push({ role: "assistant", content: `\u2705 Tagged \`${next}\`. Waiting for CI...` });
+        pushFullState(history);
+        await new Promise((r) => setTimeout(r, 30000));
+
+        const deployHealthy = checkAppHealth();
+        if (deployHealthy) {
+          currentPhase = Phase.COMPLETE;
+          history.push({ role: "assistant", content: `\u2705 **Deployed \`${next}\` successfully.** Sprint complete.` });
+          EVENT_LOG.append("orchestrator", "deploy", { tag: next });
+        } else {
+          history.push({
+            role: "assistant",
+            content: `\u26A0\uFE0F Deploy verification failed. Creating hotfix card...`,
+          });
+          // TODO: create hotfix card and re-enter EXECUTING
+          currentPhase = Phase.AWAITING_DEPLOY;
+        }
+      } else if (msg === "cancel" || msg === "\u53D6\u6D88") {
+        currentPhase = Phase.AWAITING_DEPLOY;
+        history.push({ role: "assistant", content: "Deploy cancelled. `deploy` to try again." });
+      }
+      break;
+    }
+
+    case Phase.COMPLETE: {
+      // New message after completion → start new sprint
+      currentPhase = Phase.IDLE;
+      SPRINT_PLAN = null;
+      return orchestratorChat(message, history);
+    }
   }
 
-  // status
-  if (msg === "status") {
-    const active = [...SESSIONS.entries()]
-      .filter(([, s]) => s.client)
-      .map(([n, s]) => `- **${n}**: ${s.status} (last: ${s.lastTool})`);
-    history.push({
-      role: "assistant",
-      content: `**Active agents:**\n${active.length > 0 ? active.join("\n") : "No active sessions."}`,
-    });
-    orchestratorHistory = history;
-    pushFullState(history);
-    return history;
-  }
-
-  // Default: route to Executor
-  history.push({ role: "assistant", content: "\uD83C\uDFAF Routing to **Executor**..." });
-  pushFullState(history);
-
-  const executor = getOrCreateSession("executor", "Executor");
-  try {
-    history = await streamAgent(executor, message, history);
-  } catch (e: any) {
-    history.push({ role: "assistant", content: `\u274C Error: ${e.message}` });
-  }
   orchestratorHistory = history;
   pushFullState(history);
   return history;
@@ -764,17 +667,12 @@ async function orchestratorChat(message: string, history: ChatMessage[]): Promis
 // Direct agent chat
 // ---------------------------------------------------------------------------
 async function directAgentChat(message: string, history: ChatMessage[], agentType: string): Promise<ChatMessage[]> {
-  if (!message.trim()) {
-    pushFullState(history);
-    return history;
-  }
-
+  if (!message.trim()) { pushFullState(history); return history; }
   history = [...history, { role: "user", content: message }];
   pushFullState(history);
 
   const sessionName = agentType.toLowerCase();
   const session = getOrCreateSession(sessionName, agentType);
-
   const config = AGENT_CONFIGS[agentType];
   if (config && session.messageCount === 0) {
     history.push({
@@ -790,7 +688,6 @@ async function directAgentChat(message: string, history: ChatMessage[], agentTyp
     history.push({ role: "assistant", content: `\u274C Error: ${e.message}` });
     pushFullState(history);
   }
-
   session.chatHistory = history;
   return history;
 }
@@ -802,65 +699,26 @@ async function doInterrupt(mode: string): Promise<void> {
   if (mode === "orchestrator") {
     for (const s of SESSIONS.values()) {
       if (s.isStreaming && s.client) {
-        try {
-          await s.client.interrupt();
-          s.status = "interrupted";
-          s.isStreaming = false;
-          log("interrupt", s.name);
-        } catch {}
+        try { await s.client.interrupt(); s.status = "interrupted"; s.isStreaming = false; log("interrupt", s.name); } catch {}
       }
     }
   } else {
-    const name = mode.toLowerCase();
-    const s = SESSIONS.get(name);
+    const s = SESSIONS.get(mode.toLowerCase());
     if (s?.client && s.isStreaming) {
-      try {
-        await s.client.interrupt();
-        s.status = "interrupted";
-        s.isStreaming = false;
-        log("interrupt", name);
-      } catch {}
+      try { await s.client.interrupt(); s.status = "interrupted"; s.isStreaming = false; log("interrupt", s.name); } catch {}
     }
   }
   broadcast({ type: "status", status: buildStatus() });
   broadcast({ type: "timeline", timeline: buildTimeline() });
 }
 
-async function doClose(mode: string): Promise<void> {
-  if (mode !== "orchestrator") {
-    const name = mode.toLowerCase();
-    const s = SESSIONS.get(name);
-    if (s?.client) {
-      try {
-        s.client.close?.();
-      } catch {}
-      s.client = null;
-      s.status = "closed";
-      s.isStreaming = false;
-      log("close", name);
-    }
-  }
-  pushFullState([]);
-}
-
 async function doReset(): Promise<void> {
   for (const s of SESSIONS.values()) {
-    if (s.client) {
-      try {
-        s.client.close?.();
-      } catch {}
-      s.client = null;
-    }
-    s.status = "idle";
-    s.isStreaming = false;
-    s.chatHistory = [];
-    s.lastTool = "-";
-    s.messageCount = 0;
+    if (s.client) { try { s.client.close?.(); } catch {} s.client = null; }
+    s.status = "idle"; s.isStreaming = false; s.chatHistory = []; s.lastTool = "-"; s.messageCount = 0;
   }
-  SESSIONS.clear();
-  TIMELINE.length = 0;
-  orchestratorHistory = [];
-  SPRINT_PLAN = null;
+  SESSIONS.clear(); TIMELINE.length = 0; orchestratorHistory = [];
+  SPRINT_PLAN = null; PENDING_PLAN = null; currentPhase = Phase.IDLE;
   pushFullState([]);
 }
 
@@ -869,47 +727,30 @@ async function doReset(): Promise<void> {
 // ---------------------------------------------------------------------------
 function buildStatus(): string {
   const lines = [
-    "| | Agent | Status | Last Tool | Msgs |",
-    "|---|-------|--------|-----------|------|",
-    "| \uD83C\uDFAF | Orchestrator | active | - | - |",
+    `| | Agent | Status | Last Tool | Msgs | Phase: ${currentPhase} |`,
+    "|---|-------|--------|-----------|------|------|",
   ];
-
   for (const [name, s] of SESSIONS) {
     const icon = AGENT_CONFIGS[s.agentType]?.icon ?? "\u2753";
     const dot = s.client ? "\uD83D\uDFE2" : "\u26AA";
     lines.push(`| ${icon} | ${name} | ${dot} ${s.status} | ${s.lastTool} | ${s.messageCount} |`);
   }
-
-  const activeTypes = new Set([...SESSIONS.values()].map((s) => s.agentType));
-  for (const [atype, cfg] of Object.entries(AGENT_CONFIGS)) {
-    if (!activeTypes.has(atype)) {
-      lines.push(`| ${cfg.icon} | ${atype} | \u26AA idle | - | 0 |`);
-    }
-  }
-
   return lines.join("\n");
 }
 
 function buildTimeline(): string {
   if (TIMELINE.length === 0) return "No events yet.";
   return TIMELINE.slice(-30)
-    .map((ev) => {
-      const detail = ev.detail ? ` \u2014 ${ev.detail}` : "";
-      return `${ev.ts} ${ev.agent} ${ev.action}${detail}`;
-    })
+    .map((ev) => `${ev.ts} ${ev.agent} ${ev.action}${ev.detail ? ` \u2014 ${ev.detail}` : ""}`)
     .join("\n");
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket message handler
+// WebSocket handler
 // ---------------------------------------------------------------------------
 async function handleWsMessage(_ws: any, raw: string): Promise<void> {
   let data: any;
-  try {
-    data = JSON.parse(raw);
-  } catch {
-    return;
-  }
+  try { data = JSON.parse(raw); } catch { return; }
 
   switch (data.type) {
     case "chat": {
@@ -918,34 +759,19 @@ async function handleWsMessage(_ws: any, raw: string): Promise<void> {
       if (mode === "orchestrator") {
         orchestratorHistory = await orchestratorChat(message, orchestratorHistory);
       } else {
-        const agentType = mode;
-        const name = agentType.toLowerCase();
+        const name = mode.toLowerCase();
         const session = SESSIONS.get(name);
-        const history = session?.chatHistory ?? [];
-        const result = await directAgentChat(message, history, agentType);
+        const result = await directAgentChat(message, session?.chatHistory ?? [], mode);
         const s = SESSIONS.get(name);
         if (s) s.chatHistory = result;
       }
       break;
     }
-    case "interrupt":
-      await doInterrupt(data.mode ?? "orchestrator");
-      break;
-    case "close":
-      await doClose(data.mode ?? "orchestrator");
-      break;
-    case "reset":
-      await doReset();
-      break;
+    case "interrupt": await doInterrupt(data.mode ?? "orchestrator"); break;
+    case "reset": await doReset(); break;
     case "switch_mode": {
       const mode = data.mode ?? "orchestrator";
-      if (mode === "orchestrator") {
-        pushFullState(orchestratorHistory);
-      } else {
-        const name = mode.toLowerCase();
-        const s = SESSIONS.get(name);
-        pushFullState(s?.chatHistory ?? []);
-      }
+      pushFullState(mode === "orchestrator" ? orchestratorHistory : (SESSIONS.get(mode.toLowerCase())?.chatHistory ?? []));
       break;
     }
   }
@@ -969,21 +795,16 @@ const server = Bun.serve({
   websocket: {
     open(ws) {
       clients.add(ws);
-      const json = JSON.stringify({
+      ws.send(JSON.stringify({
         type: "full",
         history: orchestratorHistory.map(({ role, content }) => ({ role, content })),
         status: buildStatus(),
         timeline: buildTimeline(),
         board: renderSprintBoard(SPRINT_PLAN),
-      });
-      ws.send(json);
+      }));
     },
-    message(ws, raw) {
-      handleWsMessage(ws, String(raw));
-    },
-    close(ws) {
-      clients.delete(ws);
-    },
+    message(ws, raw) { handleWsMessage(ws, String(raw)); },
+    close(ws) { clients.delete(ws); },
   },
 });
 

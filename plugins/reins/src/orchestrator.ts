@@ -7,12 +7,16 @@ export interface CardState {
   title: string;
   slug: string;
   wave: number;
+  dependsOn: number[];
   acceptanceCriteria: string[];
   status: string;
   prNumber: number | null;
-  reviewScore: number | null;
-  testScore: number | null;
   reviewRound: number;
+  reviewVerdict: "approve" | "request_changes" | null;
+  reviewScore: number | null;
+  reviewFindings: string[] | null;
+  codexFindings: string[] | null;
+  testScore: number | null;
 }
 
 export function createCard(
@@ -21,18 +25,23 @@ export function createCard(
   slug: string,
   wave: number,
   acceptanceCriteria: string[] = [],
+  dependsOn: number[] = [],
 ): CardState {
   return {
     id,
     title,
     slug,
     wave,
+    dependsOn,
     acceptanceCriteria,
     status: "todo",
     prNumber: null,
-    reviewScore: null,
-    testScore: null,
     reviewRound: 0,
+    reviewVerdict: null,
+    reviewScore: null,
+    reviewFindings: null,
+    codexFindings: null,
+    testScore: null,
   };
 }
 

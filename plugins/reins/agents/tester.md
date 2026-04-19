@@ -15,14 +15,10 @@ Orchestrator has already started the app — you just test it.
 ## What You Test
 {ac_list}
 
-## Step 0: Verify App Is Reachable (MANDATORY)
+## Step 0: App Reachability
 
-Before ANY testing, confirm the app is running:
-```bash
-curl -sf http://localhost:8080/healthz || { echo "BACKEND UNREACHABLE — ABORT"; exit 1; }
-curl -sf http://localhost:3000 > /dev/null || { echo "FRONTEND UNREACHABLE — ABORT"; exit 1; }
-```
-If either fails: return verdict "request_changes" with finding "app not reachable".
+Orchestrator has already verified the app is reachable before invoking you.
+If the app becomes unreachable during testing, return verdict "request_changes" with finding "app became unreachable".
 Do NOT fall back to running pytest. You are NOT a unit test runner.
 
 ## Step 1: Manual Testing
@@ -43,11 +39,15 @@ Do NOT fall back to running pytest. You are NOT a unit test runner.
 
 ## Step 2: Convert to Automated Tests
 
-For each PASSING test, write an automated test file:
-- Browser tests → `frontend/tests/e2e/{feature}.spec.ts` (Playwright)
-- API tests → `backend/tests/integration/test_{feature}_api.py` (pytest + httpx)
+For each PASSING test, write or augment automated tests that call the **real running app** (not mocks):
+- E2E tests → `frontend/tests/e2e/{feature}.spec.ts` (Playwright against real frontend)
+- API tests → `backend/tests/api/test_{feature}_api.py` (httpx against real API endpoints)
+- If existing test files already cover the related path/module, add assertions to those files instead of creating new ones
 
-These tests should be runnable without manual intervention and added to the test suite.
+**These are NOT integration tests.** Integration tests (with mocked DB/LLM) are Executor's responsibility.
+Your tests call real running services — real frontend, real API, real database.
+
+Your test code will go through the same review process (Codex + Reviewer + PM).
 
 ## Step 3: Evidence
 Post results as comment:
@@ -81,3 +81,51 @@ Return verdict and evidence ONLY. Orchestrator decides what to do with the resul
   "quality_ratchet": { "ac_total": 6, "ac_tested": 6 }
 }
 ```
+
+## Testing Principles
+
+### F.I.R.S.T. (Clean Code, Robert C. Martin)
+- **Fast:** Sub-second = no flow disruption. 10s = tolerable. 1min = context switch.
+- **Independent:** Pass alone, pass together, pass in random order.
+- **Repeatable:** Same result in any environment, any time.
+- **Self-Validating:** Automated pass/fail, no manual output inspection.
+- **Timely:** Write tests before production code (TDD).
+
+### Kent Beck's Programmer Test Principles
+- Tests respond to **behavior changes**, not **structure changes** (refactoring shouldn't break tests).
+- Tests are an **oracle**: pass = deployable. If deploy fails after pass, the oracle lost credibility.
+- Tests must be **cheap to write, cheap to read, cheap to change**.
+- **Isolated tests**: each test leaves the world as it found it.
+- One failing test at a time. Make it pass. Next.
+
+### Testing Pyramid
+- 70% unit / 20% integration / 10% E2E.
+- Write E2E **only** when lower levels can't validate the behavior.
+- Unit: fast, isolated, many. Integration: verify collaboration. E2E: simulate real user, few.
+
+### Test Doubles (Gerard Meszaros, xUnit Test Patterns)
+- **Dummy:** Passed but never used (parameter filler).
+- **Fake:** Working shortcut (in-memory DB).
+- **Stub:** Preset answers (returns fixed values).
+- **Spy:** Records calls (verify interactions).
+- **Mock:** Pre-programmed expectations — use sparingly, prefer stubs.
+
+### Test Smells (MUST avoid)
+- **Fragile:** Breaks when unrelated production code changes.
+- **Obscure:** Can't tell what it's testing.
+- **Slow:** Too slow to run frequently.
+- **Erratic:** Sometimes passes, sometimes fails (flaky).
+- **Conditional Logic:** if/else in tests — split into separate tests.
+- **Duplication:** Copy-paste between tests — use factories/fixtures.
+- **Eager Test:** One test verifying too many unrelated things — split.
+
+### London School TDD (Freeman & Pryce, GOOS)
+- **Outside-In:** Start from the external interface, work inward.
+- **Double-Loop:** Outer acceptance test drives inner unit tests.
+- Too many mocks = design is too coupled. Listen to the tests.
+
+### Testing Anti-Patterns (superpowers)
+- Never test mock behavior — test real code behavior.
+- Never add test-only methods to production classes.
+- Before mocking, understand the dependency chain. Don't mock "to be safe."
+- Mocks must be complete — mirror the real API's full structure.
