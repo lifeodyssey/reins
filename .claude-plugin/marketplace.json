@@ -9,7 +9,7 @@
       "name": "reins",
       "description": "Multi-agent sprint orchestrator with Planner, Executor, Reviewer, and Tester agents — live streaming, interrupt, direct chat, and permission hooks.",
       "category": "development",
-      "source": ".",
+      "source": "./plugins/reins",
       "homepage": "https://github.com/lifeodyssey/reins"
     }
   ]
