@@ -1,6 +1,6 @@
 {
   "name": "claude-plugin-reins",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "Multi-agent sprint orchestrator for Claude Code",
   "keywords": [
     "claude-code-plugin",
