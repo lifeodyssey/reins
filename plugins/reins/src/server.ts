@@ -29,7 +29,6 @@ const SESSIONS = new Map<string, AgentSession>();
 const TIMELINE: { ts: string; agent: string; action: string; detail: string }[] = [];
 let orchestratorHistory: ChatMessage[] = [];
 const EVENT_LOG = new EventLog(".harness/sprint-events.jsonl");
-const GH = new GitHubOps();
 let SPRINT_PLAN: SprintPlan | null = null;
 let currentPhase: Phase = Phase.IDLE;
 
@@ -41,6 +40,7 @@ interface PendingPlan {
 let PENDING_PLAN: PendingPlan | null = null;
 
 const PROJECT_ROOT = process.env.REINS_PROJECT_ROOT || process.cwd();
+const GH = new GitHubOps(PROJECT_ROOT);
 const clients = new Set<any>();
 
 // ---------------------------------------------------------------------------
@@ -200,7 +200,7 @@ function parsePlannerOutput(history: ChatMessage[]): PendingPlan | null {
 // Glue: collect PR comments (programmatic, no agent)
 // ---------------------------------------------------------------------------
 function collectPrComments(prNumber: number): string {
-  const { stdout } = Bun.spawnSync(["gh", "pr", "view", String(prNumber), "--json", "comments"]);
+  const { stdout } = Bun.spawnSync(["gh", "pr", "view", String(prNumber), "--json", "comments"], { cwd: PROJECT_ROOT });
   return stdout.toString();
 }
 
@@ -216,7 +216,7 @@ function checkAppHealth(): boolean {
 // Glue: compute next git tag
 // ---------------------------------------------------------------------------
 function computeNextTag(): { latest: string; next: string } {
-  const result = Bun.spawnSync(["git", "tag", "--sort=-v:refname"]);
+  const result = Bun.spawnSync(["git", "tag", "--sort=-v:refname"], { cwd: PROJECT_ROOT });
   const tags = result.stdout.toString().trim().split("\n").filter(Boolean);
   const latest = tags[0] ?? "v0.0.0";
   const parts = latest.replace(/^v/, "").split(".");
