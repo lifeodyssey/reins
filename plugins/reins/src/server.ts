@@ -40,6 +40,7 @@ interface PendingPlan {
 }
 let PENDING_PLAN: PendingPlan | null = null;
 
+const PROJECT_ROOT = process.env.REINS_PROJECT_ROOT || process.cwd();
 const clients = new Set<any>();
 
 // ---------------------------------------------------------------------------
@@ -93,6 +94,7 @@ function sdkOptions(opts: ReturnType<typeof getAgentOptions>) {
     model: opts.model,
     systemPrompt: opts.systemPrompt,
     allowedTools: opts.allowedTools,
+    cwd: PROJECT_ROOT,
     ...(CLAUDE_PATH ? { pathToClaudeCodeExecutable: CLAUDE_PATH } : {}),
   };
 }
